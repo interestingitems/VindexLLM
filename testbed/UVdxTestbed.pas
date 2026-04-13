@@ -10,7 +10,8 @@ uses
   System.SysUtils,
   System.IOUtils,
   VindexLLM.Utils,
-  VindexLLM.VulkanCompute;
+  VindexLLM.VulkanCompute,
+  VindexLLM.GGUFReader;
 
 // ============================================================================
 //  Embedded SPIR-V: "double every float" compute shader
@@ -283,17 +284,88 @@ begin
   end;
 end;
 
+// ============================================================================
+//  Test 04 — GGUF Reader: parse Gemma 3 4B F16
+// ============================================================================
+
+procedure Test04();
+const
+  CGGUFPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf';
+var
+  LReader: TVdxGGUFReader;
+  LTensor: TVdxGGUFTensorInfo;
+  LPtr: Pointer;
+begin
+  LReader := TVdxGGUFReader.Create();
+  try
+    LReader.SetStatusCallback(StatusCallback);
+
+    TVdxUtils.PrintLn(COLOR_CYAN + '=== Test 04: GGUF Reader ===');
+    TVdxUtils.PrintLn('File: %s', [CGGUFPath]);
+    TVdxUtils.PrintLn('');
+
+    if not LReader.Open(CGGUFPath) then
+    begin
+      TVdxUtils.PrintLn(COLOR_RED + 'TEST 04 FAILED: Could not open GGUF file');
+      Exit;
+    end;
+
+    // Summary
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn(COLOR_GREEN + '--- Summary ---');
+    TVdxUtils.PrintLn('  Version:    %d', [LReader.GetVersion()]);
+    TVdxUtils.PrintLn('  Tensors:    %d', [LReader.GetTensorCount()]);
+    TVdxUtils.PrintLn('  Metadata:   %d', [LReader.GetMetadataCount()]);
+    TVdxUtils.PrintLn('  Alignment:  %d', [LReader.GetAlignment()]);
+    TVdxUtils.PrintLn('  File size:  %.2f GB', [LReader.GetFileSize() / (1024.0 * 1024.0 * 1024.0)]);
+
+    // Check key metadata
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn(COLOR_GREEN + '--- Key Metadata ---');
+    TVdxUtils.PrintLn('  Architecture: %s', [LReader.GetMetadataString('general.architecture')]);
+    TVdxUtils.PrintLn('  Model name:   %s', [LReader.GetMetadataString('general.name')]);
+
+    // Spot-check a known FFN tensor
+    if LReader.HasTensor('blk.0.ffn_gate.weight') then
+    begin
+      TVdxUtils.PrintLn('');
+      TVdxUtils.PrintLn(COLOR_GREEN + '--- Tensor Spot Check ---');
+      LTensor := LReader.GetTensorInfo('blk.0.ffn_gate.weight');
+      TVdxUtils.PrintLn('  blk.0.ffn_gate.weight: %s [%d x %d] offset=%d',
+        [VdxGGMLTypeName(LTensor.TensorType),
+         LTensor.Dimensions[0], LTensor.Dimensions[1],
+         LTensor.DataOffset]);
+
+      LPtr := LReader.GetTensorDataPtr('blk.0.ffn_gate.weight');
+      TVdxUtils.PrintLn('  Data pointer: $%p', [LPtr]);
+
+      if LPtr <> nil then
+        TVdxUtils.PrintLn(COLOR_GREEN + 'TEST 04 PASSED: GGUF parsed and tensor data accessible!')
+      else
+        TVdxUtils.PrintLn(COLOR_RED + 'TEST 04 FAILED: Tensor data pointer is nil');
+    end
+    else
+      TVdxUtils.PrintLn(COLOR_RED + 'TEST 04 FAILED: blk.0.ffn_gate.weight not found');
+
+    LReader.Close();
+    TVdxUtils.Pause();
+  finally
+    LReader.Free();
+  end;
+end;
+
 procedure RunVdxTestbed();
 var
   LIndex: Integer;
 begin
   try
-    LIndex := 3;
+    LIndex := 4;
 
     case LIndex of
       1: Test01();
       2: Test02();
       3: Test03();
+      4: Test04();
     end;
   except
     on E: Exception do
