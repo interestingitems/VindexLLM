@@ -569,6 +569,12 @@ type
     flags: VkFlags;
   end;
 
+  VkBufferCopy = record
+    srcOffset: VkDeviceSize;
+    dstOffset: VkDeviceSize;
+    size:      VkDeviceSize;
+  end;
+
 // ============================================================================
 //  Vulkan Function Pointer Types
 // ============================================================================
@@ -631,6 +637,7 @@ type
   TvkDestroyFence = procedure(ADevice: VkDevice; AFence: VkFence; const AAllocator: Pointer); stdcall;
   TvkWaitForFences = function(ADevice: VkDevice; ACount: UInt32; const AFences: PVkFence; AWaitAll: VkBool32; ATimeout: UInt64): VkResult; stdcall;
   TvkResetFences = function(ADevice: VkDevice; ACount: UInt32; const AFences: PVkFence): VkResult; stdcall;
+  TvkCmdCopyBuffer = procedure(ACmdBuf: VkCommandBuffer; ASrcBuffer: VkBuffer; ADstBuffer: VkBuffer; ARegionCount: UInt32; const ARegions: VkBufferCopy); stdcall;
 
 // ============================================================================
 //  TVdxGpuBuffer — Lightweight record for a GPU buffer + memory pair
@@ -726,6 +733,7 @@ type
     FvkDestroyFence:              TvkDestroyFence;
     FvkWaitForFences:             TvkWaitForFences;
     FvkResetFences:               TvkResetFences;
+    FvkCmdCopyBuffer:             TvkCmdCopyBuffer;
 
     // Internal helpers
     procedure LoadVulkanLibrary();
@@ -766,6 +774,9 @@ type
 
     // Dispatch
     procedure DispatchCompute(const APipeline: VkPipeline; const APipelineLayout: VkPipelineLayout; const ADescSet: VkDescriptorSet; const AGroupsX: UInt32; const AGroupsY: UInt32 = 1; const AGroupsZ: UInt32 = 1);
+
+    // Buffer-to-buffer copy (for staging uploads to device-local memory)
+    procedure CopyBuffer(const ASrc: TVdxGpuBuffer; const ADst: TVdxGpuBuffer; const ASize: VkDeviceSize);
 
     // Cleanup helpers
     procedure DestroyDescriptorSetLayoutHandle(const ALayout: VkDescriptorSetLayout);
@@ -930,6 +941,7 @@ begin
   @FvkDestroyFence := GetVkProc('vkDestroyFence');
   @FvkWaitForFences := GetVkProc('vkWaitForFences');
   @FvkResetFences := GetVkProc('vkResetFences');
+  @FvkCmdCopyBuffer := GetVkProc('vkCmdCopyBuffer');
 end;
 
 // ============================================================================
@@ -1318,6 +1330,42 @@ begin
   FvkCmdDispatch(FCommandBuffer, AGroupsX, AGroupsY, AGroupsZ);
 
   // End and submit
+  CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
+
+  FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
+  LSubmitInfo.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  LSubmitInfo.commandBufferCount := 1;
+  LSubmitInfo.pCommandBuffers := @FCommandBuffer;
+
+  CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences');
+  CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
+  CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
+end;
+
+// ============================================================================
+//  Buffer Copy (staging → device-local)
+// ============================================================================
+
+procedure TVdxVulkanCompute.CopyBuffer(const ASrc: TVdxGpuBuffer; const ADst: TVdxGpuBuffer; const ASize: VkDeviceSize);
+var
+  LBeginInfo: VkCommandBufferBeginInfo;
+  LCopyRegion: VkBufferCopy;
+  LSubmitInfo: VkSubmitInfo;
+begin
+  // Begin command buffer
+  FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
+  LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer');
+
+  // Record copy command
+  FillChar(LCopyRegion, SizeOf(LCopyRegion), 0);
+  LCopyRegion.srcOffset := 0;
+  LCopyRegion.dstOffset := 0;
+  LCopyRegion.size := ASize;
+  FvkCmdCopyBuffer(FCommandBuffer, ASrc.Buffer, ADst.Buffer, 1, LCopyRegion);
+
+  // End and submit with fence sync
   CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
 
   FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);

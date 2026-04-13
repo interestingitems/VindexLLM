@@ -11,7 +11,8 @@ uses
   System.IOUtils,
   VindexLLM.Utils,
   VindexLLM.VulkanCompute,
-  VindexLLM.GGUFReader;
+  VindexLLM.GGUFReader,
+  VindexLLM.Vindex;
 
 // ============================================================================
 //  Embedded SPIR-V: "double every float" compute shader
@@ -354,18 +355,121 @@ begin
   end;
 end;
 
+// ============================================================================
+//  Test 05 — Vindex: build FFN layer view + GPU upload round-trip
+// ============================================================================
+
+procedure Test05();
+const
+  CGGUFPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf';
+  CVerifyCount = 16;  // Verify first 16 float16 values (32 bytes)
+  CVerifyBytes = CVerifyCount * 2;
+var
+  LReader: TVdxGGUFReader;
+  LCompute: TVdxVulkanCompute;
+  LVindex: TVdxVindex;
+  LLayer: TVdxFFNLayerView;
+  LStaging: TVdxGpuBuffer;
+  LReadback: array[0..CVerifyCount - 1] of UInt16;
+  LPassed: Boolean;
+begin
+  TVdxUtils.PrintLn(COLOR_CYAN + '=== Test 05: Vindex — FFN Layer View + GPU Upload ===');
+  TVdxUtils.PrintLn('');
+
+  // Phase 1: Parse GGUF and build vindex
+  LReader := TVdxGGUFReader.Create();
+  LCompute := TVdxVulkanCompute.Create();
+  LVindex := TVdxVindex.Create();
+  try
+    LReader.SetStatusCallback(StatusCallback);
+    LCompute.SetStatusCallback(StatusCallback);
+
+    TVdxUtils.FailIf(not LReader.Open(CGGUFPath),
+      'Failed to open GGUF: %s', [CGGUFPath]);
+
+    TVdxUtils.PrintLn('Building vindex from GGUF...');
+    TVdxUtils.FailIf(not LVindex.BuildFromGGUF(LReader),
+      'Failed to build vindex from GGUF', []);
+
+    // Print summary
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn(COLOR_GREEN + '--- Vindex Summary ---');
+    TVdxUtils.PrintLn('  Layers:       %d', [LVindex.GetLayerCount()]);
+    TVdxUtils.PrintLn('  Hidden dim:   %d', [LVindex.GetHiddenDim()]);
+    TVdxUtils.PrintLn('  FFN width:    %d', [LVindex.GetFFNWidth()]);
+
+    LLayer := LVindex.GetLayer(0);
+    TVdxUtils.PrintLn('  Gate type:    %s', [VdxGGMLTypeName(LLayer.GateType)]);
+    TVdxUtils.PrintLn('  Down type:    %s', [VdxGGMLTypeName(LLayer.DownType)]);
+    TVdxUtils.PrintLn('  Gate size:    %.2f MB', [LLayer.GateSizeBytes / (1024.0 * 1024.0)]);
+    TVdxUtils.PrintLn('  Down size:    %.2f MB', [LLayer.DownSizeBytes / (1024.0 * 1024.0)]);
+
+    // Phase 2: Init Vulkan and upload layer 0
+    TVdxUtils.PrintLn('');
+    LCompute.Init();
+
+    TVdxUtils.PrintLn('Uploading layer 0 gate+down to device-local VRAM...');
+    LVindex.UploadLayer(0, LCompute);
+    TVdxUtils.PrintLn(COLOR_GREEN + 'Upload complete.');
+
+    // Phase 3: Read back gate data and verify against mmap'd source
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn('Verifying GPU data (reading back first %d float16 values)...', [CVerifyCount]);
+
+    LLayer := LVindex.GetLayer(0);
+
+    // Create staging buffer, copy device-local → staging, download to CPU
+    LStaging := LCompute.CreateGpuBuffer(
+      CVerifyBytes,
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    );
+    try
+      LCompute.CopyBuffer(LLayer.GateGpuBuffer, LStaging, CVerifyBytes);
+      FillChar(LReadback, SizeOf(LReadback), 0);
+      LCompute.DownloadFromBuffer(LStaging, @LReadback[0], CVerifyBytes);
+    finally
+      LCompute.DestroyGpuBuffer(LStaging);
+    end;
+
+    // Compare with source mmap data using direct memory comparison
+    LPassed := CompareMem(@LReadback[0], LLayer.GatePtr, CVerifyBytes);
+
+    if LPassed then
+    begin
+      TVdxUtils.PrintLn(COLOR_GREEN + '  All %d values match!', [CVerifyCount]);
+      TVdxUtils.PrintLn('  First 4 raw F16 values: $%04X $%04X $%04X $%04X',
+        [LReadback[0], LReadback[1], LReadback[2], LReadback[3]]);
+      TVdxUtils.PrintLn('');
+      TVdxUtils.PrintLn(COLOR_GREEN + 'TEST 05 PASSED: Vindex build + GPU upload round-trip verified!');
+    end
+    else
+      TVdxUtils.PrintLn(COLOR_RED + 'TEST 05 FAILED: GPU readback mismatch');
+
+    // Cleanup GPU resources
+    LVindex.FreeAllGpu(LCompute);
+    LReader.Close();
+
+  finally
+    LVindex.Free();
+    LCompute.Free();
+    LReader.Free();
+  end;
+end;
+
 procedure RunVdxTestbed();
 var
   LIndex: Integer;
 begin
   try
-    LIndex := 4;
+    LIndex := 5;
 
     case LIndex of
       1: Test01();
       2: Test02();
       3: Test03();
       4: Test04();
+      5: Test05();
     end;
   except
     on E: Exception do

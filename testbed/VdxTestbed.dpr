@@ -12,6 +12,7 @@ uses
   VindexLLM.Resources in '..\src\VindexLLM.Resources.pas',
   VindexLLM.TOML in '..\src\VindexLLM.TOML.pas',
   VindexLLM.Utils in '..\src\VindexLLM.Utils.pas',
+  VindexLLM.Vindex in '..\src\VindexLLM.Vindex.pas',
   VindexLLM.VulkanCompute in '..\src\VindexLLM.VulkanCompute.pas';
 
 begin
