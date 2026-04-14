@@ -638,6 +638,7 @@ type
   TvkWaitForFences = function(ADevice: VkDevice; ACount: UInt32; const AFences: PVkFence; AWaitAll: VkBool32; ATimeout: UInt64): VkResult; stdcall;
   TvkResetFences = function(ADevice: VkDevice; ACount: UInt32; const AFences: PVkFence): VkResult; stdcall;
   TvkCmdCopyBuffer = procedure(ACmdBuf: VkCommandBuffer; ASrcBuffer: VkBuffer; ADstBuffer: VkBuffer; ARegionCount: UInt32; const ARegions: VkBufferCopy); stdcall;
+  TvkCmdPushConstants = procedure(ACmdBuf: VkCommandBuffer; ALayout: VkPipelineLayout; AStageFlags: VkFlags; AOffset: UInt32; ASize: UInt32; const AValues: Pointer); stdcall;
 
 // ============================================================================
 //  TVdxGpuBuffer — Lightweight record for a GPU buffer + memory pair
@@ -734,6 +735,7 @@ type
     FvkWaitForFences:             TvkWaitForFences;
     FvkResetFences:               TvkResetFences;
     FvkCmdCopyBuffer:             TvkCmdCopyBuffer;
+    FvkCmdPushConstants:          TvkCmdPushConstants;
 
     // Internal helpers
     procedure LoadVulkanLibrary();
@@ -760,11 +762,14 @@ type
     procedure DestroyGpuBuffer(var ABuffer: TVdxGpuBuffer);
     procedure UploadToBuffer(const ABuffer: TVdxGpuBuffer; const AData: Pointer; const ASize: VkDeviceSize);
     procedure DownloadFromBuffer(const ABuffer: TVdxGpuBuffer; const AData: Pointer; const ASize: VkDeviceSize);
+    function  MapBufferPersistent(const ABuffer: TVdxGpuBuffer): Pointer;
+    procedure UnmapBuffer(const ABuffer: TVdxGpuBuffer);
 
     // Shader + pipeline
     function  CreateShaderModule(const ACode: Pointer; const ACodeSize: NativeUInt): VkShaderModule;
     procedure DestroyShaderModuleHandle(const AModule: VkShaderModule);
     function  CreateComputePipelineSimple(const AShaderModule: VkShaderModule; const AEntryPoint: PAnsiChar; const ADescSetLayout: VkDescriptorSetLayout): TVdxComputePipelineBundle;
+    function  CreateComputePipelineWithPush(const AShaderModule: VkShaderModule; const AEntryPoint: PAnsiChar; const ADescSetLayout: VkDescriptorSetLayout; const APushSize: UInt32): TVdxComputePipelineBundle;
     procedure DestroyComputePipelineBundle(var ABundle: TVdxComputePipelineBundle);
 
     // Descriptor sets
@@ -774,6 +779,7 @@ type
 
     // Dispatch
     procedure DispatchCompute(const APipeline: VkPipeline; const APipelineLayout: VkPipelineLayout; const ADescSet: VkDescriptorSet; const AGroupsX: UInt32; const AGroupsY: UInt32 = 1; const AGroupsZ: UInt32 = 1);
+    procedure DispatchComputeWithPush(const APipeline: VkPipeline; const APipelineLayout: VkPipelineLayout; const ADescSet: VkDescriptorSet; const APushData: Pointer; const APushSize: UInt32; const AGroupsX: UInt32; const AGroupsY: UInt32 = 1; const AGroupsZ: UInt32 = 1);
 
     // Buffer-to-buffer copy (for staging uploads to device-local memory)
     procedure CopyBuffer(const ASrc: TVdxGpuBuffer; const ADst: TVdxGpuBuffer; const ASize: VkDeviceSize);
@@ -942,6 +948,7 @@ begin
   @FvkWaitForFences := GetVkProc('vkWaitForFences');
   @FvkResetFences := GetVkProc('vkResetFences');
   @FvkCmdCopyBuffer := GetVkProc('vkCmdCopyBuffer');
+  @FvkCmdPushConstants := GetVkProc('vkCmdPushConstants');
 end;
 
 // ============================================================================
@@ -1162,6 +1169,16 @@ begin
   FvkUnmapMemory(FDevice, ABuffer.Memory);
 end;
 
+function TVdxVulkanCompute.MapBufferPersistent(const ABuffer: TVdxGpuBuffer): Pointer;
+begin
+  CheckVk(FvkMapMemory(FDevice, ABuffer.Memory, 0, ABuffer.Size, 0, Result), 'vkMapMemory(persistent)');
+end;
+
+procedure TVdxVulkanCompute.UnmapBuffer(const ABuffer: TVdxGpuBuffer);
+begin
+  FvkUnmapMemory(FDevice, ABuffer.Memory);
+end;
+
 // ============================================================================
 //  Shader + Pipeline
 // ============================================================================
@@ -1196,6 +1213,45 @@ begin
   LLayoutInfo.sType := VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   LLayoutInfo.setLayoutCount := 1;
   LLayoutInfo.pSetLayouts := @ADescSetLayout;
+  CheckVk(FvkCreatePipelineLayout(FDevice, LLayoutInfo, nil, Result.PipelineLayout), 'vkCreatePipelineLayout');
+
+  // Shader stage
+  FillChar(LStageInfo, SizeOf(LStageInfo), 0);
+  LStageInfo.sType := VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  LStageInfo.stage := VK_SHADER_STAGE_COMPUTE_BIT;
+  LStageInfo.module := AShaderModule;
+  LStageInfo.pName := AEntryPoint;
+
+  // Compute pipeline
+  FillChar(LPipelineInfo, SizeOf(LPipelineInfo), 0);
+  LPipelineInfo.sType := VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  LPipelineInfo.stage := LStageInfo;
+  LPipelineInfo.layout := Result.PipelineLayout;
+  CheckVk(FvkCreateComputePipelines(FDevice, VK_NULL_HANDLE, 1, LPipelineInfo, nil, @Result.Pipeline), 'vkCreateComputePipelines');
+end;
+
+function TVdxVulkanCompute.CreateComputePipelineWithPush(const AShaderModule: VkShaderModule; const AEntryPoint: PAnsiChar; const ADescSetLayout: VkDescriptorSetLayout; const APushSize: UInt32): TVdxComputePipelineBundle;
+var
+  LPushRange: VkPushConstantRange;
+  LLayoutInfo: VkPipelineLayoutCreateInfo;
+  LStageInfo: VkPipelineShaderStageCreateInfo;
+  LPipelineInfo: VkComputePipelineCreateInfo;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+
+  // Push constant range for compute stage
+  FillChar(LPushRange, SizeOf(LPushRange), 0);
+  LPushRange.stageFlags := VK_SHADER_STAGE_COMPUTE_BIT;
+  LPushRange.offset := 0;
+  LPushRange.size := APushSize;
+
+  // Pipeline layout with push constants
+  FillChar(LLayoutInfo, SizeOf(LLayoutInfo), 0);
+  LLayoutInfo.sType := VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  LLayoutInfo.setLayoutCount := 1;
+  LLayoutInfo.pSetLayouts := @ADescSetLayout;
+  LLayoutInfo.pushConstantRangeCount := 1;
+  LLayoutInfo.pPushConstantRanges := @LPushRange;
   CheckVk(FvkCreatePipelineLayout(FDevice, LLayoutInfo, nil, Result.PipelineLayout), 'vkCreatePipelineLayout');
 
   // Shader stage
@@ -1325,6 +1381,40 @@ begin
   // Bind pipeline and descriptors
   FvkCmdBindPipeline(FCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, APipeline);
   FvkCmdBindDescriptorSets(FCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, APipelineLayout, 0, 1, @ADescSet, 0, nil);
+
+  // Dispatch workgroups
+  FvkCmdDispatch(FCommandBuffer, AGroupsX, AGroupsY, AGroupsZ);
+
+  // End and submit
+  CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
+
+  FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
+  LSubmitInfo.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  LSubmitInfo.commandBufferCount := 1;
+  LSubmitInfo.pCommandBuffers := @FCommandBuffer;
+
+  CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences');
+  CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
+  CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
+end;
+
+procedure TVdxVulkanCompute.DispatchComputeWithPush(const APipeline: VkPipeline; const APipelineLayout: VkPipelineLayout; const ADescSet: VkDescriptorSet; const APushData: Pointer; const APushSize: UInt32; const AGroupsX: UInt32; const AGroupsY: UInt32; const AGroupsZ: UInt32);
+var
+  LBeginInfo: VkCommandBufferBeginInfo;
+  LSubmitInfo: VkSubmitInfo;
+begin
+  // Begin command buffer
+  FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
+  LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer');
+
+  // Bind pipeline and descriptors
+  FvkCmdBindPipeline(FCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, APipeline);
+  FvkCmdBindDescriptorSets(FCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, APipelineLayout, 0, 1, @ADescSet, 0, nil);
+
+  // Push constants
+  FvkCmdPushConstants(FCommandBuffer, APipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, APushSize, APushData);
 
   // Dispatch workgroups
   FvkCmdDispatch(FCommandBuffer, AGroupsX, AGroupsY, AGroupsZ);

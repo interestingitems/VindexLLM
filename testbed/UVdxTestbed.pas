@@ -12,7 +12,8 @@ uses
   VindexLLM.Utils,
   VindexLLM.VulkanCompute,
   VindexLLM.GGUFReader,
-  VindexLLM.Vindex;
+  VindexLLM.Vindex,
+  VindexLLM.KNNWalk;
 
 // ============================================================================
 //  Embedded SPIR-V: "double every float" compute shader
@@ -457,12 +458,129 @@ begin
   end;
 end;
 
+// ============================================================================
+//  Test 06 — KNNWalk: gate scan → top-K → accumulate on layer 0
+// ============================================================================
+
+procedure Test06();
+const
+  CGGUFPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf';
+  CTopK = 128;
+var
+  LReader: TVdxGGUFReader;
+  LCompute: TVdxVulkanCompute;
+  LVindex: TVdxVindex;
+  LWalk: TVdxKNNWalk;
+  LLayer: TVdxFFNLayerView;
+  LResidualIn: array of Single;
+  LResidualOut: array of Single;
+  LHiddenDim: UInt64;
+  LI: Integer;
+  LNormIn: Double;
+  LNormOut: Double;
+  LDelta: Double;
+  LNonZero: Integer;
+begin
+  TVdxUtils.PrintLn(COLOR_CYAN + '=== Test 06: KNNWalk — FFN Walk on Layer 0 ===');
+  TVdxUtils.PrintLn('');
+
+  LReader := TVdxGGUFReader.Create();
+  LCompute := TVdxVulkanCompute.Create();
+  LVindex := TVdxVindex.Create();
+  LWalk := TVdxKNNWalk.Create();
+  try
+    LReader.SetStatusCallback(StatusCallback);
+    LCompute.SetStatusCallback(StatusCallback);
+    LWalk.SetStatusCallback(StatusCallback);
+
+    // Parse GGUF and build vindex
+    TVdxUtils.FailIf(not LReader.Open(CGGUFPath),
+      'Failed to open GGUF: %s', [CGGUFPath]);
+    TVdxUtils.FailIf(not LVindex.BuildFromGGUF(LReader),
+      'Failed to build vindex', []);
+
+    LHiddenDim := LVindex.GetHiddenDim();
+
+    // Init Vulkan and upload layer 0 (gate + down for now)
+    LCompute.Init();
+    TVdxUtils.PrintLn('Uploading layer 0 to VRAM...');
+    LVindex.UploadLayer(0, LCompute);
+
+    // Init KNN walk engine
+    LWalk.Init(LCompute, LVindex.GetHiddenDim(), LVindex.GetFFNWidth(), CTopK);
+
+    // Create input residual: unit vector along dim 0
+    SetLength(LResidualIn, LHiddenDim);
+    SetLength(LResidualOut, LHiddenDim);
+    FillChar(LResidualIn[0], LHiddenDim * SizeOf(Single), 0);
+    LResidualIn[0] := 1.0;
+
+    // Compute input L2 norm
+    LNormIn := 0.0;
+    for LI := 0 to LHiddenDim - 1 do
+      LNormIn := LNormIn + LResidualIn[LI] * LResidualIn[LI];
+    LNormIn := Sqrt(LNormIn);
+
+    // Run the walk
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn('Setting residual (unit vector dim 0)...');
+    LWalk.SetResidual(@LResidualIn[0]);
+
+    TVdxUtils.PrintLn('Walking layer 0 (topK=%d)...', [CTopK]);
+    LWalk.WalkLayer(LVindex.GetLayer(0));
+
+    TVdxUtils.PrintLn('Reading result...');
+    LWalk.GetResidual(@LResidualOut[0]);
+
+    // Compute output L2 norm and delta
+    LNormOut := 0.0;
+    LNonZero := 0;
+    for LI := 0 to LHiddenDim - 1 do
+    begin
+      LNormOut := LNormOut + LResidualOut[LI] * LResidualOut[LI];
+      if Abs(LResidualOut[LI] - LResidualIn[LI]) > 1e-9 then
+        Inc(LNonZero);
+    end;
+    LNormOut := Sqrt(LNormOut);
+    LDelta := LNormOut - LNormIn;
+
+    // Report
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn(COLOR_GREEN + '--- Results ---');
+    TVdxUtils.PrintLn('  Input L2 norm:    %.6f', [LNormIn]);
+    TVdxUtils.PrintLn('  Output L2 norm:   %.6f', [LNormOut]);
+    TVdxUtils.PrintLn('  Norm delta:       %.6f', [LDelta]);
+    TVdxUtils.PrintLn('  Dims changed:     %d / %d', [LNonZero, LHiddenDim]);
+
+    // Print first 8 output residual values
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn('  First 8 output values:');
+    for LI := 0 to 7 do
+      TVdxUtils.PrintLn('    [%d] = %.8f', [LI, LResidualOut[LI]]);
+
+    if LNonZero > 0 then
+      TVdxUtils.PrintLn(COLOR_GREEN + 'TEST 06 PASSED: KNNWalk modified the residual (%d dims changed)', [LNonZero])
+    else
+      TVdxUtils.PrintLn(COLOR_RED + 'TEST 06 FAILED: Residual unchanged after walk');
+
+    // Cleanup
+    LWalk.Cleanup();
+    LVindex.FreeAllGpu(LCompute);
+    LReader.Close();
+  finally
+    LWalk.Free();
+    LVindex.Free();
+    LCompute.Free();
+    LReader.Free();
+  end;
+end;
+
 procedure RunVdxTestbed();
 var
   LIndex: Integer;
 begin
   try
-    LIndex := 5;
+    LIndex := 6;
 
     case LIndex of
       1: Test01();
@@ -470,6 +588,7 @@ begin
       3: Test03();
       4: Test04();
       5: Test05();
+      6: Test06();
     end;
   except
     on E: Exception do

@@ -11,4 +11,16 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+%GLSLC% -V gate_scan.comp -o gate_scan.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: gate_scan.comp
+    exit /b 1
+)
+
+%GLSLC% -V accumulate.comp -o accumulate.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: accumulate.comp
+    exit /b 1
+)
+
 echo Done.

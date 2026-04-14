@@ -112,10 +112,12 @@
         <DCCReference Include="UVdxTestbed.pas"/>
         <DCCReference Include="..\src\VindexLLM.Config.pas"/>
         <DCCReference Include="..\src\VindexLLM.GGUFReader.pas"/>
+        <DCCReference Include="..\src\VindexLLM.KNNWalk.pas"/>
         <DCCReference Include="..\src\VindexLLM.Resources.pas"/>
         <DCCReference Include="..\src\VindexLLM.TOML.pas"/>
         <DCCReference Include="..\src\VindexLLM.Utils.pas"/>
         <DCCReference Include="..\src\VindexLLM.Vindex.pas"/>
+        <DCCReference Include="..\src\VindexLLM.VirtualBuffer.pas"/>
         <DCCReference Include="..\src\VindexLLM.VulkanCompute.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>

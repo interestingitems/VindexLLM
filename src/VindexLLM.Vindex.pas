@@ -25,7 +25,7 @@ uses
 
 type
 
-  PUInt16 = ^UInt64;
+  PUInt16 = ^UInt16;
 
   { TVdxFFNLayerView }
   TVdxFFNLayerView = record
