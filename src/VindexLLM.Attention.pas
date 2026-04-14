@@ -41,25 +41,6 @@ type
     ThetaBase: Single;
   end;
 
-  TVdxAttnScoresPush = record
-    HeadDim: UInt32;
-    SeqLen: UInt32;
-    Scale: Single;
-    QOffset: UInt32;
-    KOffset: UInt32;
-  end;
-
-  TVdxSoftmaxPush = record
-    SeqLen: UInt32;
-  end;
-
-  TVdxAttnValuePush = record
-    HeadDim: UInt32;
-    SeqLen: UInt32;
-    VOffset: UInt32;
-    OutOffset: UInt32;
-  end;
-
   // Multi-head push constants (all heads in one dispatch)
   TVdxAttnScoresMHPush = record
     HeadDim: UInt32;
@@ -109,9 +90,6 @@ type
     FMatVecQ8Shader: VkShaderModule;
     FQKNormShader: VkShaderModule;
     FRoPEShader: VkShaderModule;
-    FAttnScoresShader: VkShaderModule;
-    FSoftmaxShader: VkShaderModule;
-    FAttnValueShader: VkShaderModule;
     FAttnScoresMHShader: VkShaderModule;
     FSoftmaxMHShader: VkShaderModule;
     FAttnValueMHShader: VkShaderModule;
@@ -120,9 +98,6 @@ type
     FMatVecQ8Bundle: TVdxComputePipelineBundle;
     FQKNormBundle: TVdxComputePipelineBundle;
     FRoPEBundle: TVdxComputePipelineBundle;
-    FAttnScoresBundle: TVdxComputePipelineBundle;
-    FSoftmaxBundle: TVdxComputePipelineBundle;
-    FAttnValueBundle: TVdxComputePipelineBundle;
     FAttnScoresMHBundle: TVdxComputePipelineBundle;
     FSoftmaxMHBundle: TVdxComputePipelineBundle;
     FAttnValueMHBundle: TVdxComputePipelineBundle;
@@ -234,9 +209,6 @@ begin
   FMatVecQ8Shader := VK_NULL_HANDLE;
   FQKNormShader := VK_NULL_HANDLE;
   FRoPEShader := VK_NULL_HANDLE;
-  FAttnScoresShader := VK_NULL_HANDLE;
-  FSoftmaxShader := VK_NULL_HANDLE;
-  FAttnValueShader := VK_NULL_HANDLE;
   FAttnScoresMHShader := VK_NULL_HANDLE;
   FSoftmaxMHShader := VK_NULL_HANDLE;
   FAttnValueMHShader := VK_NULL_HANDLE;
@@ -245,9 +217,6 @@ begin
   FMatVecQ8Bundle.Pipeline := VK_NULL_HANDLE;
   FQKNormBundle.Pipeline := VK_NULL_HANDLE;
   FRoPEBundle.Pipeline := VK_NULL_HANDLE;
-  FAttnScoresBundle.Pipeline := VK_NULL_HANDLE;
-  FSoftmaxBundle.Pipeline := VK_NULL_HANDLE;
-  FAttnValueBundle.Pipeline := VK_NULL_HANDLE;
   FAttnScoresMHBundle.Pipeline := VK_NULL_HANDLE;
   FSoftmaxMHBundle.Pipeline := VK_NULL_HANDLE;
   FAttnValueMHBundle.Pipeline := VK_NULL_HANDLE;
@@ -314,9 +283,6 @@ begin
   FMatVecQ8Shader := LoadShader('matvec_q8_0.spv');
   FQKNormShader := LoadShader('qk_norm.spv');
   FRoPEShader := LoadShader('rope.spv');
-  FAttnScoresShader := LoadShader('attn_scores.spv');
-  FSoftmaxShader := LoadShader('softmax.spv');
-  FAttnValueShader := LoadShader('attn_value.spv');
   FAttnScoresMHShader := LoadShader('attn_scores_mh.spv');
   FSoftmaxMHShader := LoadShader('softmax_mh.spv');
   FAttnValueMHShader := LoadShader('attn_value_mh.spv');
@@ -337,16 +303,8 @@ begin
     FQKNormShader, 'main', FQKNormDescLayout, SizeOf(TVdxQKNormPush));
   FRoPEBundle := FCompute.CreateComputePipelineWithPush(
     FRoPEShader, 'main', FRoPEDescLayout, SizeOf(TVdxRoPEPush));
-  FAttnScoresBundle := FCompute.CreateComputePipelineWithPush(
-    FAttnScoresShader, 'main', FAttnScoresDescLayout,
-    SizeOf(TVdxAttnScoresPush));
-  FSoftmaxBundle := FCompute.CreateComputePipelineWithPush(
-    FSoftmaxShader, 'main', FSoftmaxDescLayout, SizeOf(TVdxSoftmaxPush));
-  FAttnValueBundle := FCompute.CreateComputePipelineWithPush(
-    FAttnValueShader, 'main', FAttnValueDescLayout,
-    SizeOf(TVdxAttnValuePush));
 
-  // Multi-head pipelines (reuse existing descriptor set layouts)
+  // Multi-head attention pipelines (reuse existing descriptor set layouts)
   FAttnScoresMHBundle := FCompute.CreateComputePipelineWithPush(
     FAttnScoresMHShader, 'main', FAttnScoresDescLayout,
     SizeOf(TVdxAttnScoresMHPush));
@@ -460,9 +418,6 @@ begin
   FCompute.DestroyComputePipelineBundle(FMatVecQ8Bundle);
   FCompute.DestroyComputePipelineBundle(FQKNormBundle);
   FCompute.DestroyComputePipelineBundle(FRoPEBundle);
-  FCompute.DestroyComputePipelineBundle(FAttnScoresBundle);
-  FCompute.DestroyComputePipelineBundle(FSoftmaxBundle);
-  FCompute.DestroyComputePipelineBundle(FAttnValueBundle);
   FCompute.DestroyComputePipelineBundle(FAttnScoresMHBundle);
   FCompute.DestroyComputePipelineBundle(FSoftmaxMHBundle);
   FCompute.DestroyComputePipelineBundle(FAttnValueMHBundle);
@@ -484,9 +439,6 @@ begin
   FCompute.DestroyShaderModuleHandle(FMatVecQ8Shader);
   FCompute.DestroyShaderModuleHandle(FQKNormShader);
   FCompute.DestroyShaderModuleHandle(FRoPEShader);
-  FCompute.DestroyShaderModuleHandle(FAttnScoresShader);
-  FCompute.DestroyShaderModuleHandle(FSoftmaxShader);
-  FCompute.DestroyShaderModuleHandle(FAttnValueShader);
   FCompute.DestroyShaderModuleHandle(FAttnScoresMHShader);
   FCompute.DestroyShaderModuleHandle(FSoftmaxMHShader);
   FCompute.DestroyShaderModuleHandle(FAttnValueMHShader);
