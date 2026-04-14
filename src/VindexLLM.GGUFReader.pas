@@ -180,6 +180,8 @@ type
 
 function VdxGGMLTypeName(const AType: TVdxGGMLType): string;
 function VdxGGMLTypeSize(const AType: TVdxGGMLType): UInt64;
+function VdxGGMLTensorBytes(const AType: TVdxGGMLType;
+  const ADim0: UInt64; const ADim1: UInt64): UInt64;
 
 implementation
 
@@ -244,6 +246,67 @@ begin
     30: Result := 2;  // BF16
   else
     Result := 0;  // quantized — block-based, not per-element
+  end;
+end;
+
+// Compute total byte size of a 2D tensor for any GGML type.
+// For non-quantized types: dim0 * dim1 * element_size.
+// For quantized types: block-based calculation.
+// Q4_0: 18 bytes per block of 32 elements.
+// Q8_0: 34 bytes per block of 32 elements.
+function VdxGGMLTensorBytes(const AType: TVdxGGMLType;
+  const ADim0: UInt64; const ADim1: UInt64): UInt64;
+var
+  LTotalElements: UInt64;
+  LNumBlocks: UInt64;
+  LElemSize: UInt64;
+begin
+  LTotalElements := ADim0 * ADim1;
+
+  case Ord(AType) of
+    2: // Q4_0: block_size=32, block_bytes=18 (2 scale + 16 qs)
+    begin
+      LNumBlocks := LTotalElements div 32;
+      Result := LNumBlocks * 18;
+    end;
+
+    3: // Q4_1: block_size=32, block_bytes=20 (2 scale + 2 min + 16 qs)
+    begin
+      LNumBlocks := LTotalElements div 32;
+      Result := LNumBlocks * 20;
+    end;
+
+    8: // Q8_0: block_size=32, block_bytes=34 (2 scale + 32 qs)
+    begin
+      LNumBlocks := LTotalElements div 32;
+      Result := LNumBlocks * 34;
+    end;
+
+    12: // Q4_K: block_size=256, block_bytes=144 (2+2 scale/min + 12 sub-scales + 128 qs)
+    begin
+      LNumBlocks := LTotalElements div 256;
+      Result := LNumBlocks * 144;
+    end;
+
+    13: // Q5_K: block_size=256, block_bytes=176 (2+2 + 12 + 32 high-bits + 128 qs)
+    begin
+      LNumBlocks := LTotalElements div 256;
+      Result := LNumBlocks * 176;
+    end;
+
+    14: // Q6_K: block_size=256, block_bytes=210 (128 ql + 64 qh + 16 scales + 2 d)
+    begin
+      LNumBlocks := LTotalElements div 256;
+      Result := LNumBlocks * 210;
+    end;
+
+  else
+    // Non-quantized: per-element size
+    LElemSize := VdxGGMLTypeSize(AType);
+    if LElemSize > 0 then
+      Result := LTotalElements * LElemSize
+    else
+      Result := 0;  // unsupported quantization type
   end;
 end;
 

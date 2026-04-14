@@ -35,6 +35,30 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+%GLSLC% -V matvec_q4_0.comp -o matvec_q4_0.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: matvec_q4_0.comp
+    exit /b 1
+)
+
+%GLSLC% -V matvec_q8_0.comp -o matvec_q8_0.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: matvec_q8_0.comp
+    exit /b 1
+)
+
+%GLSLC% -V matvec_q4_k.comp -o matvec_q4_k.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: matvec_q4_k.comp
+    exit /b 1
+)
+
+%GLSLC% -V matvec_q6_k.comp -o matvec_q6_k.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: matvec_q6_k.comp
+    exit /b 1
+)
+
 %GLSLC% -V qk_norm.comp -o qk_norm.spv
 if %ERRORLEVEL% NEQ 0 (
     echo FAILED: qk_norm.comp
@@ -68,6 +92,12 @@ if %ERRORLEVEL% NEQ 0 (
 %GLSLC% -V gelu_mul.comp -o gelu_mul.spv
 if %ERRORLEVEL% NEQ 0 (
     echo FAILED: gelu_mul.comp
+    exit /b 1
+)
+
+%GLSLC% -V vec_add.comp -o vec_add.spv
+if %ERRORLEVEL% NEQ 0 (
+    echo FAILED: vec_add.comp
     exit /b 1
 )
 

@@ -1,11 +1,15 @@
 #version 450
 
-// MatVec F16: multiply an F16 weight matrix by an F32 input vector.
-// One invocation per output row. Each thread computes the dot product
-// of one F16 row with the F32 input vector.
+// MatVec F16 (Tiled): multiply an F16 weight matrix by an F32 input vector.
+//
+// TILED: 256 threads cooperate on EACH output row via shared-memory
+// parallel reduction. Each thread computes a partial dot product over
+// a tile of the row, then they combine via tree reduction.
 //
 // Weight layout: row-major, packed F16 pairs (uint32).
 //   row r starts at: r * in_dim_half uint32s.
+//
+// Dispatch: one workgroup per output row -> (out_dim, 1, 1) workgroups.
 //
 // Bindings:
 //   0 = weight matrix (uint[], packed F16 pairs, row-major)
@@ -14,7 +18,7 @@
 //
 // Push constants:
 //   in_dim_half = input dimension / 2 (e.g., 1280 for hidden_dim=2560)
-//   out_dim     = output dimension (e.g., 2048 for Q projection)
+//   out_dim     = output dimension (for bounds check)
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -22,7 +26,6 @@ layout(push_constant) uniform PushConstants {
     uint in_dim_half;   // input dimension / 2
     uint out_dim;       // output dimension (for bounds check)
 } pc;
-
 layout(std430, binding = 0) readonly buffer WeightBuf {
     uint weight_data[];
 };
@@ -35,18 +38,22 @@ layout(std430, binding = 2) writeonly buffer OutputBuf {
     float output_vec[];
 };
 
-void main() {
-    uint row = gl_GlobalInvocationID.x;
+shared float partial[256];
 
-    // Bounds check — last workgroup may have excess invocations
-    if (row >= pc.out_dim)
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    // Bounds check — last workgroups may be excess
+    if (row >= pc.out_dim) {
         return;
+    }
 
     uint base = row * pc.in_dim_half;
     float acc = 0.0;
 
-    // Process 2 input dimensions per iteration (one packed uint32 = two F16)
-    for (uint d = 0; d < pc.in_dim_half; d++) {
+    // Each thread processes a strided tile of the row
+    for (uint d = tid; d < pc.in_dim_half; d += 256) {
         uint packed = weight_data[base + d];
         vec2 unpacked = unpackHalf2x16(packed);
 
@@ -55,5 +62,19 @@ void main() {
         acc += unpacked.y * input_vec[dim + 1];
     }
 
-    output_vec[row] = acc;
+    partial[tid] = acc;
+    barrier();
+
+    // Parallel reduction in shared memory
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        barrier();
+    }
+
+    // Thread 0 writes the final result
+    if (tid == 0) {
+        output_vec[row] = partial[0];
+    }
 }

@@ -115,7 +115,6 @@ var
   LDownName: string;
   LGateInfo: TVdxGGUFTensorInfo;
   LDownInfo: TVdxGGUFTensorInfo;
-  LElementSize: UInt64;
   LLayer: TVdxFFNLayerView;
 begin
   Result := False;
@@ -177,12 +176,12 @@ begin
     LLayer.HiddenDim := LGateInfo.Dimensions[0];
     LLayer.FeatureCount := LGateInfo.Dimensions[1];
 
-    // Compute byte sizes
-    LElementSize := VdxGGMLTypeSize(LGateInfo.TensorType);
-    LLayer.GateSizeBytes := LLayer.HiddenDim * LLayer.FeatureCount * LElementSize;
+    // Compute byte sizes (works for both F16 and quantized types)
+    LLayer.GateSizeBytes := VdxGGMLTensorBytes(LGateInfo.TensorType,
+      LGateInfo.Dimensions[0], LGateInfo.Dimensions[1]);
 
-    LElementSize := VdxGGMLTypeSize(LDownInfo.TensorType);
-    LLayer.DownSizeBytes := LDownInfo.Dimensions[0] * LDownInfo.Dimensions[1] * LElementSize;
+    LLayer.DownSizeBytes := VdxGGMLTensorBytes(LDownInfo.TensorType,
+      LDownInfo.Dimensions[0], LDownInfo.Dimensions[1]);
 
     // GPU buffers start zeroed (not yet uploaded)
     FLayers[LI] := LLayer;

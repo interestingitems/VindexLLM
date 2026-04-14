@@ -67,6 +67,7 @@ const
   VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO       = 39;
   VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO   = 40;
   VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO       = 42;
+  VK_STRUCTURE_TYPE_MEMORY_BARRIER                 = 46;
 
   // VkBufferUsageFlagBits
   VK_BUFFER_USAGE_TRANSFER_SRC_BIT    = $00000001;
@@ -96,6 +97,16 @@ const
 
   // VkCommandBufferLevel
   VK_COMMAND_BUFFER_LEVEL_PRIMARY = 0;
+
+  // VkPipelineStageFlagBits
+  VK_PIPELINE_STAGE_TRANSFER_BIT         = $00001000;
+  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT   = $00000020;
+
+  // VkAccessFlagBits
+  VK_ACCESS_SHADER_READ_BIT              = $00000020;
+  VK_ACCESS_SHADER_WRITE_BIT             = $00000040;
+  VK_ACCESS_TRANSFER_READ_BIT            = $00000800;
+  VK_ACCESS_TRANSFER_WRITE_BIT           = $00001000;
 
   // VkCommandBufferUsageFlagBits
   VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT = $00000001;
@@ -575,6 +586,13 @@ type
     size:      VkDeviceSize;
   end;
 
+  VkMemoryBarrier = record
+    sType:         VkStructureType;
+    pNext:         Pointer;
+    srcAccessMask: VkFlags;
+    dstAccessMask: VkFlags;
+  end;
+
 // ============================================================================
 //  Vulkan Function Pointer Types
 // ============================================================================
@@ -639,6 +657,7 @@ type
   TvkResetFences = function(ADevice: VkDevice; ACount: UInt32; const AFences: PVkFence): VkResult; stdcall;
   TvkCmdCopyBuffer = procedure(ACmdBuf: VkCommandBuffer; ASrcBuffer: VkBuffer; ADstBuffer: VkBuffer; ARegionCount: UInt32; const ARegions: VkBufferCopy); stdcall;
   TvkCmdPushConstants = procedure(ACmdBuf: VkCommandBuffer; ALayout: VkPipelineLayout; AStageFlags: VkFlags; AOffset: UInt32; ASize: UInt32; const AValues: Pointer); stdcall;
+  TvkCmdPipelineBarrier = procedure(ACmdBuf: VkCommandBuffer; ASrcStageMask: VkFlags; ADstStageMask: VkFlags; ADependencyFlags: VkFlags; AMemoryBarrierCount: UInt32; const AMemoryBarriers: Pointer; ABufferMemoryBarrierCount: UInt32; const ABufferMemoryBarriers: Pointer; AImageMemoryBarrierCount: UInt32; const AImageMemoryBarriers: Pointer); stdcall;
 
 // ============================================================================
 //  TVdxGpuBuffer — Lightweight record for a GPU buffer + memory pair
@@ -679,6 +698,11 @@ type
     FCommandPool:       VkCommandPool;
     FCommandBuffer:     VkCommandBuffer;
     FFence:             VkFence;
+
+    // Batch mode — records multiple dispatches into one command buffer submission
+    FBatchMode: Boolean;
+    FBatchDeferredPools: array of VkDescriptorPool;
+    FBatchDeferredPoolCount: Integer;
 
     // Device info
     FDeviceProperties:  VkPhysicalDeviceProperties;
@@ -736,6 +760,7 @@ type
     FvkResetFences:               TvkResetFences;
     FvkCmdCopyBuffer:             TvkCmdCopyBuffer;
     FvkCmdPushConstants:          TvkCmdPushConstants;
+    FvkCmdPipelineBarrier:        TvkCmdPipelineBarrier;
 
     // Internal helpers
     procedure LoadVulkanLibrary();
@@ -746,6 +771,7 @@ type
     procedure SelectPhysicalDevice();
     procedure CreateLogicalDevice();
     procedure CreateCommandResources();
+    procedure InsertBatchBarrier();
     function  FindMemoryType(const ATypeBits: UInt32; const AProperties: VkFlags): UInt32;
     function  GetVkProc(const AName: PAnsiChar): Pointer;
     procedure CheckVk(const AResult: VkResult; const AContext: string);
@@ -776,6 +802,7 @@ type
     function  CreateStorageDescriptorSetLayout(const ABindingCount: UInt32): VkDescriptorSetLayout;
     function  CreateDescriptorPoolForStorage(const AMaxSets: UInt32; const AMaxDescriptors: UInt32): VkDescriptorPool;
     function  AllocateDescriptorSetForBuffers(const APool: VkDescriptorPool; const ALayout: VkDescriptorSetLayout; const ABuffers: array of TVdxGpuBuffer): VkDescriptorSet;
+    procedure UpdateDescriptorSetBuffers(const ADescSet: VkDescriptorSet; const ABuffers: array of TVdxGpuBuffer);
 
     // Dispatch
     procedure DispatchCompute(const APipeline: VkPipeline; const APipelineLayout: VkPipelineLayout; const ADescSet: VkDescriptorSet; const AGroupsX: UInt32; const AGroupsY: UInt32 = 1; const AGroupsZ: UInt32 = 1);
@@ -784,6 +811,11 @@ type
     // Buffer-to-buffer copy (for staging uploads to device-local memory)
     procedure CopyBuffer(const ASrc: TVdxGpuBuffer; const ADst: TVdxGpuBuffer; const ASize: VkDeviceSize);
     procedure CopyBufferRegion(const ASrc: TVdxGpuBuffer; const ASrcOffset: VkDeviceSize; const ADst: TVdxGpuBuffer; const ADstOffset: VkDeviceSize; const ASize: VkDeviceSize);
+
+    // Batch mode — record multiple dispatches into one command buffer submission
+    // Reduces GPU round-trips from ~250 per token to ~1 per layer
+    procedure BeginBatch();
+    procedure EndBatch();
 
     // Cleanup helpers
     procedure DestroyDescriptorSetLayoutHandle(const ALayout: VkDescriptorSetLayout);
@@ -814,6 +846,8 @@ begin
   FCommandPool := VK_NULL_HANDLE;
   FCommandBuffer := nil;
   FFence := VK_NULL_HANDLE;
+  FBatchMode := False;
+  FBatchDeferredPoolCount := 0;
 end;
 
 procedure TVdxVulkanCompute.Init();
@@ -950,6 +984,7 @@ begin
   @FvkResetFences := GetVkProc('vkResetFences');
   @FvkCmdCopyBuffer := GetVkProc('vkCmdCopyBuffer');
   @FvkCmdPushConstants := GetVkProc('vkCmdPushConstants');
+  @FvkCmdPipelineBarrier := GetVkProc('vkCmdPipelineBarrier');
 end;
 
 // ============================================================================
@@ -1365,6 +1400,38 @@ begin
 end;
 
 // ============================================================================
+//  UpdateDescriptorSetBuffers — Rebind buffers to an existing descriptor set
+//  Cheap: no allocation, just patches buffer pointers in the driver
+// ============================================================================
+
+procedure TVdxVulkanCompute.UpdateDescriptorSetBuffers(const ADescSet: VkDescriptorSet; const ABuffers: array of TVdxGpuBuffer);
+var
+  LBufferInfos: array of VkDescriptorBufferInfo;
+  LWrites: array of VkWriteDescriptorSet;
+  LI: Integer;
+begin
+  SetLength(LBufferInfos, Length(ABuffers));
+  SetLength(LWrites, Length(ABuffers));
+
+  for LI := 0 to High(ABuffers) do
+  begin
+    LBufferInfos[LI].buffer := ABuffers[LI].Buffer;
+    LBufferInfos[LI].offset := 0;
+    LBufferInfos[LI].range := VK_WHOLE_SIZE;
+
+    FillChar(LWrites[LI], SizeOf(VkWriteDescriptorSet), 0);
+    LWrites[LI].sType := VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    LWrites[LI].dstSet := ADescSet;
+    LWrites[LI].dstBinding := UInt32(LI);
+    LWrites[LI].descriptorCount := 1;
+    LWrites[LI].descriptorType := VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    LWrites[LI].pBufferInfo := @LBufferInfos[LI];
+  end;
+
+  FvkUpdateDescriptorSets(FDevice, UInt32(Length(LWrites)), @LWrites[0], 0, nil);
+end;
+
+// ============================================================================
 //  Dispatch
 // ============================================================================
 
@@ -1373,30 +1440,37 @@ var
   LBeginInfo: VkCommandBufferBeginInfo;
   LSubmitInfo: VkSubmitInfo;
 begin
-  // Begin command buffer
-  FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
-  LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer');
+  if not FBatchMode then
+  begin
+    // Non-batch: full begin → record → end → submit → fence cycle
+    FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
+    LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer');
+  end;
 
-  // Bind pipeline and descriptors
+  // Record dispatch commands
   FvkCmdBindPipeline(FCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, APipeline);
   FvkCmdBindDescriptorSets(FCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, APipelineLayout, 0, 1, @ADescSet, 0, nil);
-
-  // Dispatch workgroups
   FvkCmdDispatch(FCommandBuffer, AGroupsX, AGroupsY, AGroupsZ);
 
-  // End and submit
-  CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
-
-  FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
-  LSubmitInfo.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  LSubmitInfo.commandBufferCount := 1;
-  LSubmitInfo.pCommandBuffers := @FCommandBuffer;
-
-  CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences');
-  CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
-  CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
+  if FBatchMode then
+  begin
+    // Batch: just insert barrier, no submit
+    InsertBatchBarrier();
+  end
+  else
+  begin
+    // Non-batch: end + submit + fence
+    CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
+    FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
+    LSubmitInfo.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    LSubmitInfo.commandBufferCount := 1;
+    LSubmitInfo.pCommandBuffers := @FCommandBuffer;
+    CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences');
+    CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
+    CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
+  end;
 end;
 
 procedure TVdxVulkanCompute.DispatchComputeWithPush(const APipeline: VkPipeline; const APipelineLayout: VkPipelineLayout; const ADescSet: VkDescriptorSet; const APushData: Pointer; const APushSize: UInt32; const AGroupsX: UInt32; const AGroupsY: UInt32; const AGroupsZ: UInt32);
@@ -1404,33 +1478,34 @@ var
   LBeginInfo: VkCommandBufferBeginInfo;
   LSubmitInfo: VkSubmitInfo;
 begin
-  // Begin command buffer
-  FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
-  LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer');
+  if not FBatchMode then
+  begin
+    FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
+    LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer');
+  end;
 
-  // Bind pipeline and descriptors
   FvkCmdBindPipeline(FCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, APipeline);
   FvkCmdBindDescriptorSets(FCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, APipelineLayout, 0, 1, @ADescSet, 0, nil);
-
-  // Push constants
   FvkCmdPushConstants(FCommandBuffer, APipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, APushSize, APushData);
-
-  // Dispatch workgroups
   FvkCmdDispatch(FCommandBuffer, AGroupsX, AGroupsY, AGroupsZ);
 
-  // End and submit
-  CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
-
-  FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
-  LSubmitInfo.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  LSubmitInfo.commandBufferCount := 1;
-  LSubmitInfo.pCommandBuffers := @FCommandBuffer;
-
-  CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences');
-  CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
-  CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
+  if FBatchMode then
+  begin
+    InsertBatchBarrier();
+  end
+  else
+  begin
+    CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
+    FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
+    LSubmitInfo.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    LSubmitInfo.commandBufferCount := 1;
+    LSubmitInfo.pCommandBuffers := @FCommandBuffer;
+    CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences');
+    CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
+    CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
+  end;
 end;
 
 // ============================================================================
@@ -1443,30 +1518,35 @@ var
   LCopyRegion: VkBufferCopy;
   LSubmitInfo: VkSubmitInfo;
 begin
-  // Begin command buffer
-  FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
-  LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer');
+  if not FBatchMode then
+  begin
+    FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
+    LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer');
+  end;
 
-  // Record copy command
   FillChar(LCopyRegion, SizeOf(LCopyRegion), 0);
   LCopyRegion.srcOffset := 0;
   LCopyRegion.dstOffset := 0;
   LCopyRegion.size := ASize;
   FvkCmdCopyBuffer(FCommandBuffer, ASrc.Buffer, ADst.Buffer, 1, LCopyRegion);
 
-  // End and submit with fence sync
-  CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
-
-  FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
-  LSubmitInfo.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  LSubmitInfo.commandBufferCount := 1;
-  LSubmitInfo.pCommandBuffers := @FCommandBuffer;
-
-  CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences');
-  CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
-  CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
+  if FBatchMode then
+  begin
+    InsertBatchBarrier();
+  end
+  else
+  begin
+    CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
+    FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
+    LSubmitInfo.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    LSubmitInfo.commandBufferCount := 1;
+    LSubmitInfo.pCommandBuffers := @FCommandBuffer;
+    CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences');
+    CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
+    CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
+  end;
 end;
 
 procedure TVdxVulkanCompute.CopyBufferRegion(const ASrc: TVdxGpuBuffer;
@@ -1477,10 +1557,13 @@ var
   LCopyRegion: VkBufferCopy;
   LSubmitInfo: VkSubmitInfo;
 begin
-  FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
-  LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer');
+  if not FBatchMode then
+  begin
+    FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
+    LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer');
+  end;
 
   FillChar(LCopyRegion, SizeOf(LCopyRegion), 0);
   LCopyRegion.srcOffset := ASrcOffset;
@@ -1488,16 +1571,89 @@ begin
   LCopyRegion.size := ASize;
   FvkCmdCopyBuffer(FCommandBuffer, ASrc.Buffer, ADst.Buffer, 1, LCopyRegion);
 
-  CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
+  if FBatchMode then
+  begin
+    InsertBatchBarrier();
+  end
+  else
+  begin
+    CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer');
+    FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
+    LSubmitInfo.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    LSubmitInfo.commandBufferCount := 1;
+    LSubmitInfo.pCommandBuffers := @FCommandBuffer;
+    CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences');
+    CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
+    CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
+  end;
+end;
 
+// ============================================================================
+//  Batch Mode — Record multiple dispatches, one submit+fence at the end
+// ============================================================================
+
+procedure TVdxVulkanCompute.InsertBatchBarrier();
+var
+  LBarrier: VkMemoryBarrier;
+begin
+  // Full memory barrier covering compute→compute and transfer→compute
+  FillChar(LBarrier, SizeOf(LBarrier), 0);
+  LBarrier.sType := VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  LBarrier.srcAccessMask := VK_ACCESS_SHADER_WRITE_BIT or VK_ACCESS_TRANSFER_WRITE_BIT;
+  LBarrier.dstAccessMask := VK_ACCESS_SHADER_READ_BIT or VK_ACCESS_SHADER_WRITE_BIT
+    or VK_ACCESS_TRANSFER_READ_BIT or VK_ACCESS_TRANSFER_WRITE_BIT;
+
+  FvkCmdPipelineBarrier(
+    FCommandBuffer,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT or VK_PIPELINE_STAGE_TRANSFER_BIT,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT or VK_PIPELINE_STAGE_TRANSFER_BIT,
+    0,
+    1, @LBarrier,
+    0, nil,
+    0, nil);
+end;
+
+procedure TVdxVulkanCompute.BeginBatch();
+var
+  LBeginInfo: VkCommandBufferBeginInfo;
+begin
+  TVdxUtils.FailIf(FBatchMode, 'VulkanCompute: BeginBatch called while already in batch mode', []);
+
+  FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
+  LBeginInfo.sType := VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  LBeginInfo.flags := VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  CheckVk(FvkBeginCommandBuffer(FCommandBuffer, LBeginInfo), 'vkBeginCommandBuffer(batch)');
+
+  FBatchMode := True;
+  FBatchDeferredPoolCount := 0;
+end;
+
+procedure TVdxVulkanCompute.EndBatch();
+var
+  LSubmitInfo: VkSubmitInfo;
+  LI: Integer;
+begin
+  TVdxUtils.FailIf(not FBatchMode, 'VulkanCompute: EndBatch called without BeginBatch', []);
+
+  // End command buffer recording
+  CheckVk(FvkEndCommandBuffer(FCommandBuffer), 'vkEndCommandBuffer(batch)');
+
+  // Submit once and wait once
   FillChar(LSubmitInfo, SizeOf(LSubmitInfo), 0);
   LSubmitInfo.sType := VK_STRUCTURE_TYPE_SUBMIT_INFO;
   LSubmitInfo.commandBufferCount := 1;
   LSubmitInfo.pCommandBuffers := @FCommandBuffer;
 
-  CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences');
-  CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit');
-  CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences');
+  CheckVk(FvkResetFences(FDevice, 1, @FFence), 'vkResetFences(batch)');
+  CheckVk(FvkQueueSubmit(FComputeQueue, 1, LSubmitInfo, FFence), 'vkQueueSubmit(batch)');
+  CheckVk(FvkWaitForFences(FDevice, 1, @FFence, VK_TRUE, UInt64($FFFFFFFFFFFFFFFF)), 'vkWaitForFences(batch)');
+
+  // Destroy deferred descriptor pools now that GPU work is complete
+  for LI := 0 to FBatchDeferredPoolCount - 1 do
+    FvkDestroyDescriptorPool(FDevice, FBatchDeferredPools[LI], nil);
+  FBatchDeferredPoolCount := 0;
+
+  FBatchMode := False;
 end;
 
 // ============================================================================
@@ -1512,7 +1668,18 @@ end;
 
 procedure TVdxVulkanCompute.DestroyDescriptorPoolHandle(const APool: VkDescriptorPool);
 begin
-  if APool <> VK_NULL_HANDLE then
+  if APool = VK_NULL_HANDLE then
+    Exit;
+
+  if FBatchMode then
+  begin
+    // Defer destruction until EndBatch — descriptor sets must stay valid
+    if FBatchDeferredPoolCount >= Length(FBatchDeferredPools) then
+      SetLength(FBatchDeferredPools, FBatchDeferredPoolCount + 64);
+    FBatchDeferredPools[FBatchDeferredPoolCount] := APool;
+    Inc(FBatchDeferredPoolCount);
+  end
+  else
     FvkDestroyDescriptorPool(FDevice, APool, nil);
 end;
 

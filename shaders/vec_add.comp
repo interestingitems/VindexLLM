@@ -1,0 +1,32 @@
+#version 450
+
+// Vec-Add: a[i] = a[i] + b[i], in-place on buffer A.
+//
+// Bindings:
+//   0 = a (float[], read-write, overwritten with a + b)
+//   1 = b (float[], read-only)
+//
+// Push constants:
+//   count = number of elements
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+} pc;
+
+layout(std430, binding = 0) buffer BufA {
+    float a_data[];
+};
+
+layout(std430, binding = 1) readonly buffer BufB {
+    float b_data[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.count)
+        return;
+
+    a_data[idx] = a_data[idx] + b_data[idx];
+}

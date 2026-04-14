@@ -1,0 +1,102 @@
+#version 450
+
+// MatVec Q6_K: multiply a Q6_K weight matrix by an F32 input vector.
+// One invocation per output row.
+//
+// Q6_K super-block (210 bytes, 256 elements):
+//   bytes 0-127:   uint8[128] ql  (lower 4 bits of 6-bit quants)
+//   bytes 128-191: uint8[64]  qh  (upper 2 bits of 6-bit quants)
+//   bytes 192-207: int8[16]   scales (per-sub-block scale, 16 elements each)
+//   bytes 208-209: f16 'd'    (super-block scale)
+//
+// 6-bit quant = (ql_nibble | (qh_2bits << 4)) - 32
+// Dequant: value = d * scales[sub_block] * q6_value
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint in_dim;
+    uint out_dim;
+} pc;
+
+layout(std430, binding = 0) readonly buffer WeightBuf {
+    uint weight_data[];
+};
+
+layout(std430, binding = 1) readonly buffer InputBuf {
+    float input_vec[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutputBuf {
+    float output_vec[];
+};
+
+uint read_byte(uint byte_off) {
+    return (weight_data[byte_off >> 2] >> ((byte_off & 3) * 8)) & 0xFF;
+}
+
+// Read int8 (signed byte)
+float read_int8(uint byte_off) {
+    uint b = read_byte(byte_off);
+    return (b < 128) ? float(b) : float(b) - 256.0;
+}
+
+float read_f16(uint byte_off) {
+    uint lo = read_byte(byte_off);
+    uint hi = read_byte(byte_off + 1);
+    return unpackHalf2x16(lo | (hi << 8)).x;
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.out_dim)
+        return;
+
+    uint blocks_per_row = pc.in_dim >> 8;  // in_dim / 256
+    uint row_byte_off = row * blocks_per_row * 210;
+
+    float acc = 0.0;
+
+    for (uint b = 0; b < blocks_per_row; b++) {
+        uint blk = row_byte_off + b * 210;
+
+        uint ql_base = blk;           // ql[128] at offset 0
+        uint qh_base = blk + 128;     // qh[64] at offset 128
+        uint sc_base = blk + 192;     // scales[16] at offset 192
+        float d = read_f16(blk + 208); // d at offset 208
+
+        uint base_elem = b * 256;
+
+        // Process two halves of 128 elements each
+        for (uint n = 0; n < 2; n++) {
+            uint ql_off = ql_base + n * 64;
+            uint qh_off = qh_base + n * 32;
+            uint is = n * 8;  // scale index base
+
+            for (uint l = 0; l < 32; l++) {
+                uint ql0 = read_byte(ql_off + l);
+                uint ql1 = read_byte(ql_off + l + 32);
+                uint qh0 = read_byte(qh_off + l);
+
+                // Reconstruct 6-bit values: 4 bits from ql + 2 bits from qh
+                float q1 = float(int((ql0 & 0xFu) | (((qh0 >> 0) & 3u) << 4))) - 32.0;
+                float q2 = float(int((ql1 & 0xFu) | (((qh0 >> 2) & 3u) << 4))) - 32.0;
+                float q3 = float(int((ql0 >> 4)    | (((qh0 >> 4) & 3u) << 4))) - 32.0;
+                float q4 = float(int((ql1 >> 4)    | (((qh0 >> 6) & 3u) << 4))) - 32.0;
+
+                float s1 = read_int8(sc_base + is + 0);
+                float s2 = read_int8(sc_base + is + 2);
+                float s3 = read_int8(sc_base + is + 4);
+                float s4 = read_int8(sc_base + is + 6);
+
+                uint e = base_elem + n * 128;
+                acc += d * s1 * q1 * input_vec[e + l];
+                acc += d * s2 * q2 * input_vec[e + l + 32];
+                acc += d * s3 * q3 * input_vec[e + l + 64];
+                acc += d * s4 * q4 * input_vec[e + l + 96];
+            }
+        }
+    }
+
+    output_vec[row] = acc;
+}

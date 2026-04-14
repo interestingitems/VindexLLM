@@ -1,0 +1,117 @@
+#version 450
+
+// MatVec Q4_K: multiply a Q4_K weight matrix by an F32 input vector.
+// One invocation per output row.
+//
+// Q4_K super-block (144 bytes, 256 elements):
+//   bytes 0-1:   f16 'd'    (super-block scale)
+//   bytes 2-3:   f16 'dmin' (super-block minimum)
+//   bytes 4-15:  uint8[12]  (packed 6-bit sub-block scales and mins)
+//   bytes 16-143: uint8[128] (4-bit quantized values)
+//
+// 8 sub-blocks of 32 elements, processed in 4 pairs of 64 elements:
+//   Pair p (p=0..3): uses qs[p*32..(p+1)*32-1]
+//     - Low nibbles  -> elements p*64 .. p*64+31    (scale = is*2)
+//     - High nibbles -> elements p*64+32 .. p*64+63  (scale = is*2+1)
+//
+// Dequant: value = d * sub_scale * nibble - dmin * sub_min
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint in_dim;
+    uint out_dim;
+} pc;
+
+layout(std430, binding = 0) readonly buffer WeightBuf {
+    uint weight_data[];
+};
+
+layout(std430, binding = 1) readonly buffer InputBuf {
+    float input_vec[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutputBuf {
+    float output_vec[];
+};
+
+uint read_byte(uint byte_off) {
+    return (weight_data[byte_off >> 2] >> ((byte_off & 3) * 8)) & 0xFF;
+}
+
+float read_f16(uint byte_off) {
+    uint lo = read_byte(byte_off);
+    uint hi = read_byte(byte_off + 1);
+    return unpackHalf2x16(lo | (hi << 8)).x;
+}
+
+// Unpack one sub-block scale or min from the 12-byte scales array.
+// j = sub-block index (0..7), sc_base = byte offset of scales[0]
+void get_scale_min(uint j, uint sc_base, out float sc, out float mn) {
+    uint s_val, m_val;
+    if (j < 4) {
+        s_val = read_byte(sc_base + j) & 63u;
+        m_val = read_byte(sc_base + j + 4) & 63u;
+    } else {
+        s_val = (read_byte(sc_base + j + 4) & 0xFu)
+              | ((read_byte(sc_base + j - 4) >> 6) << 4);
+        m_val = (read_byte(sc_base + j + 4) >> 4)
+              | ((read_byte(sc_base + j) >> 6) << 4);
+    }
+    sc = float(s_val);
+    mn = float(m_val);
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.out_dim)
+        return;
+
+    uint blocks_per_row = pc.in_dim >> 8;  // in_dim / 256
+    uint row_byte_off = row * blocks_per_row * 144;
+
+    float acc = 0.0;
+
+    for (uint b = 0; b < blocks_per_row; b++) {
+        uint blk = row_byte_off + b * 144;
+
+        // Read super-block scale and min
+        float d    = read_f16(blk);
+        float dmin = read_f16(blk + 2);
+
+        uint sc_base = blk + 4;    // scales[12] start
+        uint qs_base = blk + 16;   // qs[128] start
+        uint base_elem = b * 256;
+
+        // Process 4 pairs of 64 elements (is = 0,2,4,6)
+        uint q_off = qs_base;
+        for (uint p = 0; p < 4; p++) {
+            float sc1, mn1, sc2, mn2;
+            get_scale_min(p * 2, sc_base, sc1, mn1);
+            get_scale_min(p * 2 + 1, sc_base, sc2, mn2);
+
+            float d1 = d * sc1;
+            float m1 = dmin * mn1;
+            float d2 = d * sc2;
+            float m2 = dmin * mn2;
+
+            uint elem = base_elem + p * 64;
+
+            // Low nibbles -> first 32 elements of this pair
+            for (uint l = 0; l < 32; l++) {
+                float v = d1 * float(read_byte(q_off + l) & 0xF) - m1;
+                acc += v * input_vec[elem + l];
+            }
+
+            // High nibbles -> next 32 elements of this pair
+            for (uint l = 0; l < 32; l++) {
+                float v = d2 * float(read_byte(q_off + l) >> 4) - m2;
+                acc += v * input_vec[elem + 32 + l];
+            }
+
+            q_off += 32;
+        }
+    }
+
+    output_vec[row] = acc;
+}

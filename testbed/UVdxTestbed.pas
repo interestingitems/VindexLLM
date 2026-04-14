@@ -7,6 +7,7 @@ procedure RunVdxTestbed();
 implementation
 
 uses
+  WinAPI.Windows,
   System.SysUtils,
   System.IOUtils,
   System.Math,
@@ -22,7 +23,22 @@ end;
 function PrintToken(const AToken: string; const AUserData: Pointer): Boolean;
 begin
   Write(AToken);
-  Result := True;
+  Result := (GetAsyncKeyState(VK_ESCAPE) and $8000) = 0;
+end;
+
+procedure PrintStats(const AStats: PVdxInferenceStats);
+const
+  CStopReasons: array[TVdxStopReason] of string = (
+    'none', 'eos', 'stop_token', 'max_tokens', 'callback_stopped');
+begin
+  WriteLn;
+  WriteLn(Format('Prefill:    %d tokens in %.0fms (%.1f tok/s)', [
+    AStats.PrefillTokens, AStats.PrefillTimeMs, AStats.PrefillTokPerSec]));
+  WriteLn(Format('Generation: %d tokens in %.0fms (%.1f tok/s)', [
+    AStats.GeneratedTokens, AStats.GenerationTimeMs, AStats.GenerationTokPerSec]));
+  WriteLn(Format('TTFT: %.0fms | Total: %.0fms | Stop: %s', [
+    AStats.TimeToFirstTokenMs, AStats.TotalTimeMs,
+    CStopReasons[AStats.StopReason]]));
 end;
 
 procedure Test01();
@@ -33,10 +49,12 @@ begin
   LInference := TVdxInference.Create();
   try
     LInference.SetStatusCallback(StatusCallback, nil);
-    LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf');
+    //LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf');
+    LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-Q8_0.gguf');
     LInference.SetTokenCallback(PrintToken, nil);
-    //WriteLn(LInference.Generate('What is the capital of France?'));
-    LInference.Generate('What is the capital of France?');
+    //LInference.Generate('What is the capital of France?');
+    LInference.Generate('Who is bill gates?');
+    PrintStats(LInference.GetStats());
     LInference.UnloadModel();
   finally
     LInference.Free();
