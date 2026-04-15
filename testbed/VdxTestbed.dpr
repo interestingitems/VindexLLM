@@ -33,7 +33,8 @@ uses
   VindexLLM.TurboQuant in '..\src\VindexLLM.TurboQuant.pas',
   VindexLLM.Utils in '..\src\VindexLLM.Utils.pas',
   VindexLLM.VirtualBuffer in '..\src\VindexLLM.VirtualBuffer.pas',
-  VindexLLM.Vulkan in '..\src\VindexLLM.Vulkan.pas';
+  VindexLLM.Vulkan in '..\src\VindexLLM.Vulkan.pas',
+  VindexLLM.Sampler in '..\src\VindexLLM.Sampler.pas';
 
 begin
   RunVdxTestbed();

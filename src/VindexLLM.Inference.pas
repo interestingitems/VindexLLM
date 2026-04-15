@@ -32,6 +32,7 @@ uses
   VindexLLM.ChatTemplate,
   VindexLLM.VirtualBuffer,
   VindexLLM.Shaders,
+  VindexLLM.Sampler,
   VIndexLLM.FFNWeights;
 
 // ============================================================================
@@ -102,6 +103,7 @@ type
     FAttn: TVdxAttention;
     FVindex: TVdxFFNWeights;
     FTokenizer: TVdxTokenizer;
+    FSampler: TVdxSampler;
 
     // Token callback
     FTokenCallback: TVdxCallback<TVdxTokenCallback>;
@@ -241,6 +243,8 @@ type
 
     procedure AddStopToken(const ATokenId: Integer);
     procedure ClearStopTokens();
+
+    procedure SetSamplerConfig(const AConfig: TVdxSamplerConfig);
 
     // Stats from last Generate() call — pointer to internal record
     function GetStats(): PVdxInferenceStats;
@@ -621,11 +625,6 @@ begin
 end;
 
 function TVdxInference.RunUnembedding(): Integer;
-var
-  LBestId: Integer;
-  LBestScore: Single;
-  LLogits: PSingle;
-  LI: Integer;
 begin
 
   // Batched: fused copy+norm residual → work, matvec → logits
@@ -643,20 +642,8 @@ begin
   FCompute.DownloadFromBuffer(FLogitsBuf, FLogitsVBuf.Memory,
     UInt64(FVocabSize) * SizeOf(Single));
 
-  // Argmax over logits
-  LLogits := PSingle(FLogitsVBuf.Memory);
-  LBestId := 0;
-  LBestScore := LLogits^;
-  for LI := 1 to FVocabSize - 1 do
-  begin
-    if PSingle(PByte(LLogits) + UInt64(LI) * SizeOf(Single))^ > LBestScore then
-    begin
-      LBestId := LI;
-      LBestScore := PSingle(PByte(LLogits) + UInt64(LI) * SizeOf(Single))^;
-    end;
-  end;
-
-  Result := LBestId;
+  // Sample next token (greedy argmax with default config)
+  Result := FSampler.Process(System.PSingle(FLogitsVBuf.Memory), FVocabSize);
 end;
 
 procedure TVdxInference.LoadModel(const AGGUFPath: string);
@@ -678,6 +665,7 @@ begin
   FAttn := TVdxAttention.Create();
   FVindex := TVdxFFNWeights.Create();
   FTokenizer := TVdxTokenizer.Create();
+  FSampler := TVdxSampler.Create();
 
   // Forward status callback to subsystems
   FReader.SetStatusCallback(FStatusCallback.Callback, FStatusCallback.UserData);
@@ -1008,6 +996,11 @@ begin
   FTokenCallback.UserData := AUserData;
 end;
 
+procedure TVdxInference.SetSamplerConfig(const AConfig: TVdxSamplerConfig);
+begin
+  FSampler.SetConfig(AConfig);
+end;
+
 procedure TVdxInference.AddStopToken(const ATokenId: Integer);
 begin
   if not FStopTokenIds.Contains(ATokenId) then
@@ -1059,6 +1052,8 @@ begin
   LTotalWatch := TStopwatch.StartNew();
   LResult := TStringBuilder.Create();
   try
+    // Reset sampler history for this generation
+    FSampler.ResetHistory();
     // --- Prefill: batch all prompt tokens through the model (Phase 6D) ---
     LPrefillWatch := TStopwatch.StartNew();
 
@@ -1098,6 +1093,9 @@ begin
       LTokenStr := FTokenizer.Decode(
         TArray<Integer>.Create(LNextTokenId));
       LResult.Append(LTokenStr);
+
+      // Track token for repetition penalty
+      FSampler.AddToHistory(LNextTokenId);
 
       // Call token callback if assigned
       if FTokenCallback.IsAssigned() then
@@ -1239,6 +1237,7 @@ begin
 
   // Destroy subsystem objects
   FreeAndNil(FTokenizer);
+  FreeAndNil(FSampler);
   FreeAndNil(FVindex);
   FreeAndNil(FAttn);
   FreeAndNil(FNorm);
