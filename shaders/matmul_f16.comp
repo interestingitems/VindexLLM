@@ -1,0 +1,93 @@
+#version 450
+
+// MatMul F16 (Tiled): F16 weight matrix x F32 input matrix -> F32 output matrix
+//
+// Computes: Y[tok][row] = dot(W[row], X[tok]) for all (row, tok) pairs
+// This is the batched version of matvec_f16.comp for prefill.
+//
+// Weight layout: row-major, packed F16 pairs (uint32) — same as matvec_f16
+//   row r starts at: r * in_dim_half uint32s
+// Input layout: row-major F32 [num_tokens x in_dim]
+//   token t, element d: input_mat[t * in_dim + d]
+// Output layout: row-major F32 [num_tokens x out_dim]
+//   token t, row r: output_mat[t * out_dim + r]
+//
+// Dispatch: 2D — (out_dim, num_tokens, 1) workgroups
+//   gl_WorkGroupID.x = output row
+//   gl_WorkGroupID.y = token index
+//
+// Each workgroup: 256 threads cooperate on one dot product via shared-memory
+// parallel reduction (identical inner loop to matvec_f16)
+//
+// Bindings:
+//   0 = weight matrix (uint[], packed F16 pairs, row-major)
+//   1 = input matrix  (float[], num_tokens x in_dim, row-major)
+//   2 = output matrix (float[], num_tokens x out_dim, row-major)
+//
+// Push constants:
+//   in_dim_half  = input dimension / 2
+//   out_dim      = output dimension (for bounds check)
+//   num_tokens   = number of tokens in batch
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint in_dim_half;   // input dimension / 2
+    uint out_dim;       // output dimension (for bounds check)
+    uint num_tokens;    // number of tokens in batch
+} pc;
+
+layout(std430, binding = 0) readonly buffer WeightBuf {
+    uint weight_data[];
+};
+
+layout(std430, binding = 1) readonly buffer InputBuf {
+    float input_mat[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutputBuf {
+    float output_mat[];
+};
+
+shared float partial[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    // Bounds check
+    if (row >= pc.out_dim || tok >= pc.num_tokens)
+        return;
+
+    uint weight_base = row * pc.in_dim_half;
+    uint in_dim = pc.in_dim_half * 2;
+    uint input_base = tok * in_dim;
+    float acc = 0.0;
+
+    // Each thread processes a strided tile of the row
+    for (uint d = tid; d < pc.in_dim_half; d += 256) {
+        uint packed = weight_data[weight_base + d];
+        vec2 unpacked = unpackHalf2x16(packed);
+
+        uint dim = d * 2;
+        acc += unpacked.x * input_mat[input_base + dim];
+        acc += unpacked.y * input_mat[input_base + dim + 1];
+    }
+
+    partial[tid] = acc;
+    barrier();
+
+    // Parallel reduction in shared memory
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        barrier();
+    }
+
+    // Thread 0 writes the final result
+    if (tid == 0) {
+        output_mat[tok * pc.out_dim + row] = partial[0];
+    }
+}

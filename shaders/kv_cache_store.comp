@@ -1,0 +1,62 @@
+#version 450
+
+// KV Cache Store: scatter K and V head vectors into KV cache at position.
+// Replaces per-head CopyBufferRegion calls with a single compute dispatch.
+//
+// One workgroup per KV head (local_size_x = 256 = HeadDim).
+// Each workgroup copies HeadDim floats for both K and V.
+//
+// Cache layout: [NumKVHeads × MaxSeqLen × HeadDim]
+// Source layout: [NumKVHeads × HeadDim] (contiguous heads)
+//
+// Bindings:
+//   0 = K projection buffer (readonly, NumKVHeads * HeadDim floats)
+//   1 = V projection buffer (readonly, NumKVHeads * HeadDim floats)
+//   2 = K cache (read/write, NumKVHeads * MaxSeqLen * HeadDim floats)
+//   3 = V cache (read/write, NumKVHeads * MaxSeqLen * HeadDim floats)
+//
+// Push constants:
+//   head_dim    = elements per head (256)
+//   max_seq     = max sequence length
+//   position    = current sequence position to store at
+//   num_kv_heads = number of KV heads (4)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint head_dim;
+    uint max_seq;
+    uint position;
+    uint num_kv_heads;
+} pc;
+layout(std430, binding = 0) readonly buffer KBuf {
+    float k_proj[];
+};
+
+layout(std430, binding = 1) readonly buffer VBuf {
+    float v_proj[];
+};
+
+layout(std430, binding = 2) buffer KCache {
+    float k_cache[];
+};
+
+layout(std430, binding = 3) buffer VCache {
+    float v_cache[];
+};
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint elem = gl_LocalInvocationID.x;
+
+    if (head >= pc.num_kv_heads || elem >= pc.head_dim) return;
+
+    // Source: contiguous heads [head * head_dim + elem]
+    uint src_idx = head * pc.head_dim + elem;
+
+    // Dest: [head * max_seq * head_dim + position * head_dim + elem]
+    uint dst_idx = (head * pc.max_seq + pc.position) * pc.head_dim + elem;
+
+    k_cache[dst_idx] = k_proj[src_idx];
+    v_cache[dst_idx] = v_proj[src_idx];
+}

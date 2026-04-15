@@ -1,0 +1,68 @@
+#version 450
+
+// Batched RoPE: Rotary Position Embedding for N tokens' heads.
+// Each token gets position = start_pos + gl_WorkGroupID.y.
+// Uses "rotary half" convention (same as rope.comp):
+//   pairs are (i, i + half_dim) for i in [0, half_dim-1].
+//
+// Data layout: [NumTokens x NumHeads x HeadDim], row-major
+//   element(tok, head, d) = data[tok * NumHeads * HeadDim + head * HeadDim + d]
+//
+// Dispatch 2D: (NumHeads, NumTokens)
+//   X = head index, Y = token index
+//
+// Bindings:
+//   0 = data buffer (float[], read/write in-place)
+//
+// Push constants:
+//   head_dim   = dimension per head (256)
+//   num_heads  = heads per token (8 for Q, 4 for K)
+//   num_tokens = number of tokens in batch
+//   theta_base = base frequency (10000.0 or 1000000.0)
+//   start_pos  = position of first token (0 for prefill)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  head_dim;
+    uint  num_heads;
+    uint  num_tokens;
+    float theta_base;
+    uint  start_pos;
+} pc;
+
+layout(std430, binding = 0) buffer VectorBuf {
+    float vec_data[];
+};
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (head >= pc.num_heads || tok >= pc.num_tokens)
+        return;
+
+    uint half_dim = pc.head_dim / 2;
+    uint position = pc.start_pos + tok;
+
+    // Base offset for this token's head in the flat buffer
+    uint offset = (tok * pc.num_heads + head) * pc.head_dim;
+
+    // Each thread handles dimension pairs with stride loop
+    for (uint i = tid; i < half_dim; i += 128) {
+        float freq = pow(pc.theta_base, -float(2 * i) / float(pc.head_dim));
+        float theta = float(position) * freq;
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+
+        uint idx_a = offset + i;
+        uint idx_b = offset + i + half_dim;
+
+        float a = vec_data[idx_a];
+        float b = vec_data[idx_b];
+
+        vec_data[idx_a] = a * cos_t - b * sin_t;
+        vec_data[idx_b] = a * sin_t + b * cos_t;
+    }
+}

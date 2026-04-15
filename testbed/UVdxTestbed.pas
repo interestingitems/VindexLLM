@@ -1,4 +1,4 @@
-﻿unit UVdxTestbed;
+unit UVdxTestbed;
 
 interface
 
@@ -13,7 +13,6 @@ uses
   System.Math,
   VindexLLM.Utils,
   VindexLLM.Inference;
-
 
 procedure StatusCallback(const AText: string; const AUserData: Pointer);
 begin
@@ -42,6 +41,16 @@ begin
 end;
 
 procedure Test01();
+const
+  CPrompt =
+  '''
+    Explain the differences between these three sorting algorithms: bubble sort,
+    merge sort, and quicksort. For each one, describe how it works step by step,
+    give the best-case and worst-case time complexity using big-O notation,
+    explain when you would choose it over the others, and provide a real-world
+    analogy that helps illustrate the concept. Also discuss whether each
+    algorithm is stable or unstable, and what that means in practice.
+  ''';
 var
   LInference: TVdxInference;
 begin
@@ -52,8 +61,9 @@ begin
     //LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-f16.gguf');
     LInference.LoadModel('C:\Dev\LLM\GGUF\gemma-3-4b-it-Q8_0.gguf');
     LInference.SetTokenCallback(PrintToken, nil);
-    //LInference.Generate('What is the capital of France?');
-    LInference.Generate('Who is bill gates?');
+    LInference.Generate('What is the capital of France?');
+    //LInference.Generate('Who is bill gates?');
+    //LInference.Generate(CPrompt);
     PrintStats(LInference.GetStats());
     LInference.UnloadModel();
   finally

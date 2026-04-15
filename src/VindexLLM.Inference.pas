@@ -51,6 +51,13 @@ type
     EmbedScale: Single;
   end;
 
+  // Batched embedding lookup push constants (Phase 6D)
+  TVdxEmbedBatchPush = record
+    DimParam: UInt32;    // hidden_dim/2 for F16, hidden_dim for Q8_0
+    EmbedScale: Single;
+    NumTokens: UInt32;
+  end;
+
 // ============================================================================
 //  Stop reason — why generation ended
 // ============================================================================
@@ -171,6 +178,33 @@ type
     FEmbedDescPool: VkDescriptorPool;
     FEmbedDescSet: VkDescriptorSet;
 
+    // Batched GPU embedding lookup (Phase 6D — prefill batching)
+    FEmbedBatchF16Shader: VkShaderModule;
+    FEmbedBatchQ8Shader: VkShaderModule;
+    FEmbedBatchF16Bundle: TVdxComputePipelineBundle;
+    FEmbedBatchQ8Bundle: TVdxComputePipelineBundle;
+    FEmbedBatchDescLayout: VkDescriptorSetLayout;  // 3 bindings: table, output, token_ids
+    FEmbedBatchDescPool: VkDescriptorPool;
+    FEmbedBatchDescSet: VkDescriptorSet;
+    FTokenIdsGpu: TVdxGpuBuffer;   // host-visible, holds token IDs for batched embed
+
+    // Batched prefill matrix buffers (Phase 6D)
+    FResidualMat: TVdxGpuBuffer;    // [MaxSeq x HiddenDim] F32
+    FWorkMat: TVdxGpuBuffer;        // [MaxSeq x HiddenDim] F32
+    FQMat: TVdxGpuBuffer;           // [MaxSeq x NumQHeads*HeadDim] F32
+    FKMat: TVdxGpuBuffer;           // [MaxSeq x NumKVHeads*HeadDim] F32
+    FVMat: TVdxGpuBuffer;           // [MaxSeq x NumKVHeads*HeadDim] F32
+    FAttnOutMatBuf: TVdxGpuBuffer;  // [MaxSeq x HiddenDim] F32
+    FGateMat: TVdxGpuBuffer;        // [MaxSeq x FFNWidth] F32
+    FUpMatBuf: TVdxGpuBuffer;       // [MaxSeq x FFNWidth] F32
+    FFFNOutMat: TVdxGpuBuffer;      // [MaxSeq x HiddenDim] F32
+
+    // Batched elementwise descriptor sets (Phase 6D)
+    FBatchEWDescPool: VkDescriptorPool;
+    FBatchVecAddAttnDescSet: VkDescriptorSet;
+    FBatchVecAddFFNDescSet: VkDescriptorSet;
+    FBatchGeluMulDescSet: VkDescriptorSet;
+
     // GPU unembedding (avoids slow CPU F16 scan)
     FEmbedGpu: TVdxGpuBuffer;     // F16 embedding table on GPU
     FLogitsBuf: TVdxGpuBuffer;    // F32 logits output [VocabSize], host-visible
@@ -190,8 +224,12 @@ type
       const ACount: UInt32): TVdxGpuBuffer;
     function UploadWeightTensor(const ATensorName: string): TVdxGpuBuffer;
     procedure EmbedToken(const ATokenId: Integer);
+    procedure EmbedTokensBatch(const ATokenIds: TArray<Integer>;
+      const ANumTokens: Integer; const AOutputBuf: TVdxGpuBuffer);
     procedure RunLayerForward(const ALayer: Integer;
       const APosition: Integer);
+    procedure RunLayerForwardBatch(const ALayer: Integer;
+      const ANumTokens: UInt32);
     function RunUnembedding(): Integer;
 
   public
@@ -395,6 +433,53 @@ begin
 end;
 
 // ============================================================================
+//  EmbedTokensBatch — GPU batched embedding: look up N tokens at once,
+//  dequantize + scale, write to output matrix [N x HiddenDim].
+//  Uploads token IDs to GPU, then dispatches batched embed shader.
+//  Must be called inside an active batch (BeginBatch/EndBatch).
+// ============================================================================
+
+procedure TVdxInference.EmbedTokensBatch(const ATokenIds: TArray<Integer>;
+  const ANumTokens: Integer; const AOutputBuf: TVdxGpuBuffer);
+var
+  LPush: TVdxEmbedBatchPush;
+  LIds: array of UInt32;
+  LI: Integer;
+begin
+  // Convert Integer token IDs to UInt32 and upload to GPU
+  SetLength(LIds, ANumTokens);
+  for LI := 0 to ANumTokens - 1 do
+    LIds[LI] := UInt32(ATokenIds[LI]);
+  FCompute.UploadToBuffer(FTokenIdsGpu, @LIds[0],
+    UInt64(ANumTokens) * SizeOf(UInt32));
+
+  // Rebind descriptor set with current output matrix
+  FCompute.UpdateDescriptorSetBuffers(FEmbedBatchDescSet,
+    [FEmbedGpu, AOutputBuf, FTokenIdsGpu]);
+
+  LPush.EmbedScale := FEmbedScale;
+  LPush.NumTokens := UInt32(ANumTokens);
+
+  if FEmbedType = gtQ8_0 then
+  begin
+    LPush.DimParam := FHiddenDim;
+    FCompute.DispatchComputeWithPush(
+      FEmbedBatchQ8Bundle.Pipeline, FEmbedBatchQ8Bundle.PipelineLayout,
+      FEmbedBatchDescSet, @LPush, SizeOf(LPush),
+      UInt32(ANumTokens));  // one workgroup per token
+  end
+  else
+  begin
+    LPush.DimParam := FHiddenDim div 2;
+    FCompute.DispatchComputeWithPush(
+      FEmbedBatchF16Bundle.Pipeline, FEmbedBatchF16Bundle.PipelineLayout,
+      FEmbedBatchDescSet, @LPush, SizeOf(LPush),
+      (FHiddenDim div 2 + 255) div 256, UInt32(ANumTokens));  // 2D dispatch
+  end;
+  FCompute.BatchBarrier(); // Output matrix ready for first layer
+end;
+
+// ============================================================================
 //  RunLayerForward — Process one transformer layer (attn + FFN)
 //  Sandwich norm pattern: PreNorm → Op → PostNorm → residual add
 //  All operations recorded into the active batch — no individual submits
@@ -403,21 +488,15 @@ end;
 procedure TVdxInference.RunLayerForward(const ALayer: Integer;
   const APosition: Integer);
 var
-  LBufSize: UInt64;
   LTheta: Single;
   LGeluPush: TVdxGeluMulPush;
   LVecAddPush: TVdxVecAddPush;
 begin
-  LBufSize := UInt64(FHiddenDim) * SizeOf(Single);
-
   // === Attention branch: x = x + PostAttnNorm(Attn(PreAttnNorm(x))) ===
 
-  // Copy residual to work buffer for in-place norming (GPU→GPU copy)
-  FCompute.CopyBuffer(FResidualGpu, FWorkBufA, LBufSize);
-  FCompute.BatchBarrier(); // WorkBufA ready for norm
-
-  // PreAttnNorm in-place on work buffer
-  FNorm.Apply(FWorkBufA, FNormWeights[ALayer].AttnNormGpu, FHiddenDim);
+  // Fused copy+norm: residual → PreAttnNorm → WorkBufA (no separate copy)
+  FNorm.ApplyCopy(FResidualGpu, FNormWeights[ALayer].AttnNormGpu,
+    FWorkBufA, FHiddenDim);
   FCompute.BatchBarrier(); // WorkBufA normed, ready for attention matvecs
 
   // Per-layer RoPE theta: full layers use 1M, sliding layers use 10K
@@ -452,12 +531,9 @@ begin
 
   // === FFN branch: x = x + PostFFNNorm(FFN(PreFFNNorm(x))) ===
 
-  // Copy residual to work buffer for in-place norming
-  FCompute.CopyBuffer(FResidualGpu, FWorkBufA, LBufSize);
-  FCompute.BatchBarrier(); // WorkBufA ready for FFN norm
-
-  // PreFFNNorm in-place on work buffer
-  FNorm.Apply(FWorkBufA, FNormWeights[ALayer].FFNNormGpu, FHiddenDim);
+  // Fused copy+norm: residual → PreFFNNorm → WorkBufA (no separate copy)
+  FNorm.ApplyCopy(FResidualGpu, FNormWeights[ALayer].FFNNormGpu,
+    FWorkBufA, FHiddenDim);
   FCompute.BatchBarrier(); // WorkBufA normed, ready for gate/up matvecs
 
   // Dense FFN: gate(x), up(x), GELU(gate)*up, down(hidden)
@@ -499,6 +575,94 @@ begin
 end;
 
 // ============================================================================
+//  RunLayerForwardBatch — Process one transformer layer for N tokens (Phase 6D)
+//  Same sandwich norm pattern as RunLayerForward but on matrices.
+//  Uses batched matmul, batched norms, and existing vec-add/gelu-mul with N×dim.
+// ============================================================================
+
+procedure TVdxInference.RunLayerForwardBatch(const ALayer: Integer;
+  const ANumTokens: UInt32);
+var
+  LTheta: Single;
+  LGeluPush: TVdxGeluMulPush;
+  LVecAddPush: TVdxVecAddPush;
+begin
+  // === Attention branch ===
+
+  // Fused copy+norm batch: FResidualMat → PreAttnNorm → FWorkMat
+  FNorm.ApplyCopyBatch(FResidualMat, FNormWeights[ALayer].AttnNormGpu,
+    FWorkMat, FHiddenDim, ANumTokens);
+  FCompute.BatchBarrier();
+
+  // Per-layer RoPE theta
+  if ALayer mod 6 = 5 then
+    LTheta := 1000000.0
+  else
+    LTheta := 10000.0;
+
+  // Full batched attention: FWorkMat → FAttnOutMatBuf
+  FAttn.ForwardBatch(FWorkMat, FAttnWeights[ALayer],
+    FNormWeights[ALayer].QNormGpu, FNormWeights[ALayer].KNormGpu,
+    ALayer, ANumTokens, LTheta,
+    FQMat, FKMat, FVMat, FAttnOutMatBuf);
+
+  // PostAttnNorm batch on attention output
+  FNorm.ApplyBatch(FAttnOutMatBuf,
+    FNormWeights[ALayer].PostAttnNormGpu, FHiddenDim, ANumTokens);
+  FCompute.BatchBarrier();
+
+  // Vec-add batch: FResidualMat += FAttnOutMatBuf (count = N x HiddenDim)
+  LVecAddPush.Count := ANumTokens * FHiddenDim;
+  FCompute.DispatchComputeWithPush(
+    FVecAddBundle.Pipeline, FVecAddBundle.PipelineLayout,
+    FBatchVecAddAttnDescSet, @LVecAddPush, SizeOf(LVecAddPush),
+    (ANumTokens * FHiddenDim + 255) div 256);
+  FCompute.BatchBarrier();
+
+  // === FFN branch ===
+
+  // Fused copy+norm batch: FResidualMat → PreFFNNorm → FWorkMat
+  FNorm.ApplyCopyBatch(FResidualMat, FNormWeights[ALayer].FFNNormGpu,
+    FWorkMat, FHiddenDim, ANumTokens);
+  FCompute.BatchBarrier();
+
+  // Gate matmul: FWorkMat → FGateMat
+  FAttn.BatchMatMul(FVindex.GetLayer(ALayer).GateGpuBuffer,
+    FWorkMat, FGateMat, FHiddenDim, FFFNWidth, ANumTokens, FWeightType);
+
+  // Up matmul: FWorkMat → FUpMatBuf
+  FAttn.BatchMatMul(FUpWeights[ALayer],
+    FWorkMat, FUpMatBuf, FHiddenDim, FFFNWidth, ANumTokens, FWeightType);
+  FCompute.BatchBarrier();
+
+  // GELU-mul batch: FGateMat = GELU(FGateMat) * FUpMatBuf (count = N x FFNWidth)
+  LGeluPush.Count := ANumTokens * FFFNWidth;
+  FCompute.DispatchComputeWithPush(
+    FGeluMulBundle.Pipeline, FGeluMulBundle.PipelineLayout,
+    FBatchGeluMulDescSet, @LGeluPush, SizeOf(LGeluPush),
+    (ANumTokens * FFFNWidth + 255) div 256);
+  FCompute.BatchBarrier();
+
+  // Down matmul: FGateMat → FFFNOutMat
+  FAttn.BatchMatMul(FVindex.GetLayer(ALayer).DownGpuBuffer,
+    FGateMat, FFFNOutMat, FFFNWidth, FHiddenDim, ANumTokens, FWeightType);
+  FCompute.BatchBarrier();
+
+  // PostFFNNorm batch on FFN output
+  FNorm.ApplyBatch(FFFNOutMat,
+    FNormWeights[ALayer].PostFFNNormGpu, FHiddenDim, ANumTokens);
+  FCompute.BatchBarrier();
+
+  // Vec-add batch: FResidualMat += FFFNOutMat
+  LVecAddPush.Count := ANumTokens * FHiddenDim;
+  FCompute.DispatchComputeWithPush(
+    FVecAddBundle.Pipeline, FVecAddBundle.PipelineLayout,
+    FBatchVecAddFFNDescSet, @LVecAddPush, SizeOf(LVecAddPush),
+    (ANumTokens * FHiddenDim + 255) div 256);
+  FCompute.BatchBarrier();
+end;
+
+// ============================================================================
 //  RunUnembedding — Apply final norm, GPU matvec for logits, CPU argmax
 //  Called inside an active batch — records norm + matvec, then EndBatch
 //  is called by the caller before downloading logits
@@ -506,20 +670,17 @@ end;
 
 function TVdxInference.RunUnembedding(): Integer;
 var
-  LBufSize: UInt64;
   LBestId: Integer;
   LBestScore: Single;
   LLogits: PSingle;
   LI: Integer;
 begin
-  LBufSize := UInt64(FHiddenDim) * SizeOf(Single);
 
-  // Batched: copy residual → work, norm, matvec → logits
+  // Batched: fused copy+norm residual → work, matvec → logits
   FCompute.BeginBatch();
 
-  FCompute.CopyBuffer(FResidualGpu, FWorkBufA, LBufSize);
-  FCompute.BatchBarrier(); // WorkBufA ready for norm
-  FNorm.Apply(FWorkBufA, FOutputNormGpu, FHiddenDim);
+  // Fused copy+norm: residual → OutputNorm → WorkBufA (no separate copy)
+  FNorm.ApplyCopy(FResidualGpu, FOutputNormGpu, FWorkBufA, FHiddenDim);
   FCompute.BatchBarrier(); // WorkBufA normed, ready for unembedding matvec
   FAttn.TestMatVec(FEmbedGpu, FWorkBufA, FLogitsBuf,
     FHiddenDim, UInt32(FVocabSize), FEmbedType);
@@ -801,6 +962,100 @@ begin
   FEmbedDescSet := FCompute.AllocateDescriptorSetForBuffers(
     FEmbedDescPool, FEmbedDescLayout, [FEmbedGpu, FResidualGpu]);
 
+  // --- Batched GPU embedding lookup pipeline (Phase 6D) ---
+  LSpvPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)),
+    '..\shaders\embed_lookup_batch_f16.spv');
+  LSpvPath := TPath.GetFullPath(LSpvPath);
+  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  FEmbedBatchF16Shader := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+
+  LSpvPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)),
+    '..\shaders\embed_lookup_batch_q8.spv');
+  LSpvPath := TPath.GetFullPath(LSpvPath);
+  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  FEmbedBatchQ8Shader := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+
+  // 3 bindings: embed table, output matrix, token IDs
+  FEmbedBatchDescLayout := FCompute.CreateStorageDescriptorSetLayout(3);
+  FEmbedBatchF16Bundle := FCompute.CreateComputePipelineWithPush(
+    FEmbedBatchF16Shader, 'main', FEmbedBatchDescLayout,
+    SizeOf(TVdxEmbedBatchPush));
+  FEmbedBatchQ8Bundle := FCompute.CreateComputePipelineWithPush(
+    FEmbedBatchQ8Shader, 'main', FEmbedBatchDescLayout,
+    SizeOf(TVdxEmbedBatchPush));
+
+  // Token IDs buffer: host-visible, sized for max sequence length
+  FTokenIdsGpu := FCompute.CreateGpuBuffer(
+    UInt64(FMaxSeqLen) * SizeOf(UInt32),
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+  // Pre-allocate descriptor pool + set (rebound per call via UpdateDescriptorSetBuffers)
+  FEmbedBatchDescPool := FCompute.CreateDescriptorPoolForStorage(1, 3);
+  FEmbedBatchDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FEmbedBatchDescPool, FEmbedBatchDescLayout,
+    [FEmbedGpu, FResidualGpu, FTokenIdsGpu]);
+
+  // --- Batched prefill matrix buffers (Phase 6D) ---
+  Status('  Allocating prefill matrix buffers...');
+
+  FResidualMat := FCompute.CreateGpuBuffer(
+    UInt64(FMaxSeqLen) * FHiddenDim * SizeOf(Single),
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  FWorkMat := FCompute.CreateGpuBuffer(
+    UInt64(FMaxSeqLen) * FHiddenDim * SizeOf(Single),
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  FQMat := FCompute.CreateGpuBuffer(
+    UInt64(FMaxSeqLen) * FNumQHeads * FHeadDim * SizeOf(Single),
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  FKMat := FCompute.CreateGpuBuffer(
+    UInt64(FMaxSeqLen) * FNumKVHeads * FHeadDim * SizeOf(Single),
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  FVMat := FCompute.CreateGpuBuffer(
+    UInt64(FMaxSeqLen) * FNumKVHeads * FHeadDim * SizeOf(Single),
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  FAttnOutMatBuf := FCompute.CreateGpuBuffer(
+    UInt64(FMaxSeqLen) * FHiddenDim * SizeOf(Single),
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  FGateMat := FCompute.CreateGpuBuffer(
+    UInt64(FMaxSeqLen) * FFFNWidth * SizeOf(Single),
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  FUpMatBuf := FCompute.CreateGpuBuffer(
+    UInt64(FMaxSeqLen) * FFFNWidth * SizeOf(Single),
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  FFFNOutMat := FCompute.CreateGpuBuffer(
+    UInt64(FMaxSeqLen) * FHiddenDim * SizeOf(Single),
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  // Batch elementwise descriptor sets (vec-add + gelu-mul on matrices)
+  // 3 sets, total bindings = 2+2+2 = 6
+  FBatchEWDescPool := FCompute.CreateDescriptorPoolForStorage(3, 6);
+  FBatchVecAddAttnDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FBatchEWDescPool, FVecAddDescLayout, [FResidualMat, FAttnOutMatBuf]);
+  FBatchVecAddFFNDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FBatchEWDescPool, FVecAddDescLayout, [FResidualMat, FFFNOutMat]);
+  FBatchGeluMulDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FBatchEWDescPool, FGeluMulDescLayout, [FGateMat, FUpMatBuf]);
+
   // Logits buffer: F32 x VocabSize, host-visible for CPU argmax
   FLogitsBuf := FCompute.CreateGpuBuffer(
     UInt64(FVocabSize) * SizeOf(Single),
@@ -867,7 +1122,6 @@ var
   LFormatted: string;
   LTokenIds: TArray<Integer>;
   LTokenCount: Integer;
-  LPos: Integer;
   LLayer: Integer;
   LNextTokenId: Integer;
   LTokenStr: string;
@@ -893,16 +1147,22 @@ begin
   LTotalWatch := TStopwatch.StartNew();
   LResult := TStringBuilder.Create();
   try
-    // --- Prefill: process all prompt tokens through the model ---
+    // --- Prefill: batch all prompt tokens through the model (Phase 6D) ---
     LPrefillWatch := TStopwatch.StartNew();
-    for LPos := 0 to LTokenCount - 1 do
-    begin
-      FCompute.BeginBatch();
-      EmbedToken(LTokenIds[LPos]);
-      for LLayer := 0 to Integer(FNumLayers) - 1 do
-        RunLayerForward(LLayer, LPos);
-      FCompute.EndBatch();
-    end;
+
+    FCompute.BeginBatch();
+    EmbedTokensBatch(LTokenIds, LTokenCount, FResidualMat);
+    for LLayer := 0 to Integer(FNumLayers) - 1 do
+      RunLayerForwardBatch(LLayer, UInt32(LTokenCount));
+    FCompute.EndBatch();
+
+    // Copy last token's residual from matrix to vector for generation handoff
+    FCompute.CopyBufferRegion(
+      FResidualMat,
+      UInt64(LTokenCount - 1) * UInt64(FHiddenDim) * SizeOf(Single),
+      FResidualGpu, 0,
+      UInt64(FHiddenDim) * SizeOf(Single));
+
     LPrefillWatch.Stop();
 
     // --- Autoregressive generation ---
@@ -1005,6 +1265,27 @@ begin
   FCompute.DestroyDescriptorSetLayoutHandle(FEmbedDescLayout);
   FCompute.DestroyShaderModuleHandle(FEmbedF16Shader);
   FCompute.DestroyShaderModuleHandle(FEmbedQ8Shader);
+
+  // Free batched embed pipeline (Phase 6D)
+  FCompute.DestroyDescriptorPoolHandle(FEmbedBatchDescPool);
+  FCompute.DestroyComputePipelineBundle(FEmbedBatchF16Bundle);
+  FCompute.DestroyComputePipelineBundle(FEmbedBatchQ8Bundle);
+  FCompute.DestroyDescriptorSetLayoutHandle(FEmbedBatchDescLayout);
+  FCompute.DestroyShaderModuleHandle(FEmbedBatchF16Shader);
+  FCompute.DestroyShaderModuleHandle(FEmbedBatchQ8Shader);
+  FCompute.DestroyGpuBuffer(FTokenIdsGpu);
+
+  // Free batched prefill matrix buffers (Phase 6D)
+  FCompute.DestroyDescriptorPoolHandle(FBatchEWDescPool);
+  FCompute.DestroyGpuBuffer(FResidualMat);
+  FCompute.DestroyGpuBuffer(FWorkMat);
+  FCompute.DestroyGpuBuffer(FQMat);
+  FCompute.DestroyGpuBuffer(FKMat);
+  FCompute.DestroyGpuBuffer(FVMat);
+  FCompute.DestroyGpuBuffer(FAttnOutMatBuf);
+  FCompute.DestroyGpuBuffer(FGateMat);
+  FCompute.DestroyGpuBuffer(FUpMatBuf);
+  FCompute.DestroyGpuBuffer(FFFNOutMat);
 
   // Free work buffers
   FCompute.DestroyGpuBuffer(FResidualGpu);

@@ -1,0 +1,74 @@
+#version 450
+
+// Fused RMSNorm+Copy: reads from source, normalizes, writes to dest.
+// Eliminates the separate CopyBuffer + in-place RMSNorm pattern.
+// Single workgroup dispatch (1,1,1). All work done in shared memory.
+//
+// Formula: dest[i] = (source[i] / rms) * weight[i]
+//          rms = sqrt(sum(source[j]^2) / dim + eps)
+//
+// Bindings:
+//   0 = source vector (float[], HiddenDim elements, read-only)
+//   1 = weight vector (float[], HiddenDim elements, read-only)
+//   2 = dest vector   (float[], HiddenDim elements, write-only)
+//
+// Push constants:
+//   hidden_dim = number of elements (2560 for Gemma 3 4B)
+//   eps        = epsilon for numerical stability (1e-6)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  hidden_dim;
+    float eps;
+} pc;
+
+layout(std430, binding = 0) readonly buffer SourceBuf {
+    float source[];
+};
+
+layout(std430, binding = 1) readonly buffer WeightBuf {
+    float weight[];
+};
+layout(std430, binding = 2) writeonly buffer DestBuf {
+    float dest[];
+};
+
+// Shared memory for parallel reduction
+shared float partial_sums[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.hidden_dim;
+
+    // Phase 1: Each thread accumulates sum-of-squares for its elements
+    float sum_sq = 0.0;
+    for (uint i = tid; i < dim; i += 256) {
+        float val = source[i];
+        sum_sq += val * val;
+    }
+    partial_sums[tid] = sum_sq;
+
+    barrier();
+
+    // Parallel reduction in shared memory
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial_sums[tid] += partial_sums[tid + stride];
+        }
+        barrier();
+    }
+
+    // Thread 0 computes the final RMS value and stores in shared[0]
+    if (tid == 0) {
+        partial_sums[0] = 1.0 / sqrt(partial_sums[0] / float(dim) + pc.eps);
+    }
+
+    barrier();
+
+    // Phase 2: Each thread normalizes and writes to dest (source untouched)
+    float inv_rms = partial_sums[0];
+    for (uint i = tid; i < dim; i += 256) {
+        dest[i] = source[i] * inv_rms * weight[i];
+    }
+}

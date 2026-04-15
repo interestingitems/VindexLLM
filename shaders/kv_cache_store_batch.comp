@@ -1,0 +1,70 @@
+#version 450
+
+// Batched KV Cache Store: scatter N tokens' K and V head vectors into cache.
+// Token t stored at cache position start_pos + t.
+//
+// Source layout: [NumTokens x NumKVHeads x HeadDim], row-major
+// Cache layout:  [NumKVHeads x MaxSeq x HeadDim]
+//
+// Dispatch 2D: (NumKVHeads, NumTokens)
+//   X = KV head index, Y = token index
+//   256 threads per workgroup copy HeadDim floats
+//
+// Bindings:
+//   0 = K projection matrix (readonly)
+//   1 = V projection matrix (readonly)
+//   2 = K cache (read/write)
+//   3 = V cache (read/write)
+//
+// Push constants:
+//   head_dim     = elements per head (256)
+//   max_seq      = max sequence length (cache stride)
+//   num_kv_heads = number of KV heads (4)
+//   num_tokens   = number of tokens in batch
+//   start_pos    = cache position for first token (0 for prefill)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint head_dim;
+    uint max_seq;
+    uint num_kv_heads;
+    uint num_tokens;
+    uint start_pos;
+} pc;
+
+layout(std430, binding = 0) readonly buffer KBuf {
+    float k_proj[];
+};
+
+layout(std430, binding = 1) readonly buffer VBuf {
+    float v_proj[];
+};
+
+layout(std430, binding = 2) buffer KCache {
+    float k_cache[];
+};
+
+layout(std430, binding = 3) buffer VCache {
+    float v_cache[];
+};
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint elem = gl_LocalInvocationID.x;
+
+    if (head >= pc.num_kv_heads || tok >= pc.num_tokens || elem >= pc.head_dim)
+        return;
+
+    uint position = pc.start_pos + tok;
+
+    // Source: [tok * NumKVHeads * HeadDim + head * HeadDim + elem]
+    uint src_idx = (tok * pc.num_kv_heads + head) * pc.head_dim + elem;
+
+    // Dest: [head * MaxSeq * HeadDim + position * HeadDim + elem]
+    uint dst_idx = (head * pc.max_seq + position) * pc.head_dim + elem;
+
+    k_cache[dst_idx] = k_proj[src_idx];
+    v_cache[dst_idx] = v_proj[src_idx];
+}

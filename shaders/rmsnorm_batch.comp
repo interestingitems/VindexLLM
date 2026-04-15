@@ -1,0 +1,70 @@
+#version 450
+
+// Batched RMSNorm: normalize each row of a matrix in-place.
+// Dispatch (num_tokens, 1, 1) — one workgroup per token row.
+//
+// Formula: mat[tok][i] = (mat[tok][i] / rms) * weight[i]
+//          rms = sqrt(sum(mat[tok][j]^2) / dim + eps)
+//
+// Bindings:
+//   0 = matrix (float[], num_tokens x hidden_dim, read/write)
+//   1 = weight vector (float[], hidden_dim elements, read-only, shared)
+//
+// Push constants:
+//   hidden_dim  = elements per row
+//   eps         = numerical stability epsilon
+//   num_tokens  = number of rows (for bounds check)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  hidden_dim;
+    float eps;
+    uint  num_tokens;
+} pc;
+
+layout(std430, binding = 0) buffer MatrixBuf {
+    float mat_data[];
+};
+
+layout(std430, binding = 1) readonly buffer WeightBuf {
+    float weight[];
+};
+
+shared float partial_sums[256];
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (tok >= pc.num_tokens)
+        return;
+
+    uint base = tok * pc.hidden_dim;
+    uint dim = pc.hidden_dim;
+
+    // Phase 1: sum-of-squares for this row
+    float sum_sq = 0.0;
+    for (uint i = tid; i < dim; i += 256) {
+        float val = mat_data[base + i];
+        sum_sq += val * val;
+    }
+    partial_sums[tid] = sum_sq;
+    barrier();
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            partial_sums[tid] += partial_sums[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0)
+        partial_sums[0] = 1.0 / sqrt(partial_sums[0] / float(dim) + pc.eps);
+    barrier();
+
+    // Phase 2: normalize in-place
+    float inv_rms = partial_sums[0];
+    for (uint i = tid; i < dim; i += 256) {
+        mat_data[base + i] = mat_data[base + i] * inv_rms * weight[i];
+    }
+}

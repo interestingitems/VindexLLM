@@ -1,0 +1,57 @@
+#version 450
+
+// Batched GPU Embedding Lookup (F16): read N rows from F16 embedding table,
+// convert to F32 with scaling, write to output matrix rows.
+//
+// Dispatch: 2D — (ceil(dim_param / 256), num_tokens, 1)
+//   gl_WorkGroupID.x * 256 + tid = packed F16 pair index within row
+//   gl_WorkGroupID.y = token index
+//
+// Bindings:
+//   0 = embedding table (uint[], packed F16 pairs, row-major)
+//   1 = output matrix   (float[], num_tokens x hidden_dim, row-major)
+//   2 = token IDs       (uint[], num_tokens entries)
+//
+// Push constants:
+//   dim_param    = hidden_dim / 2 (packed F16 pairs per row)
+//   embed_scale  = sqrt(hidden_dim) scaling factor
+//   num_tokens   = number of tokens to look up
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  dim_param;     // hidden_dim / 2
+    float embed_scale;
+    uint  num_tokens;
+} pc;
+
+layout(std430, binding = 0) readonly buffer EmbedBuf {
+    uint embed_data[];
+};
+
+layout(std430, binding = 1) writeonly buffer OutputBuf {
+    float output_mat[];
+};
+
+layout(std430, binding = 2) readonly buffer TokenIdsBuf {
+    uint token_ids[];
+};
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;  // packed pair index within row
+    uint tok = gl_WorkGroupID.y;       // token index
+
+    if (d >= pc.dim_param || tok >= pc.num_tokens)
+        return;
+
+    uint token_id = token_ids[tok];
+    uint embed_base = token_id * pc.dim_param;
+    uint packed = embed_data[embed_base + d];
+    vec2 unpacked = unpackHalf2x16(packed);
+
+    uint in_dim = pc.dim_param * 2;
+    uint out_base = tok * in_dim;
+    uint dim = d * 2;
+    output_mat[out_base + dim] = unpacked.x * pc.embed_scale;
+    output_mat[out_base + dim + 1] = unpacked.y * pc.embed_scale;
+}

@@ -29,6 +29,13 @@ type
     Eps: Single;
   end;
 
+  // Push constant layout matching rmsnorm_batch.comp / rmsnorm_copy_batch.comp
+  TVdxRMSNormBatchPush = record
+    HiddenDim: UInt32;
+    Eps: Single;
+    NumTokens: UInt32;
+  end;
+
   // Per-layer norm weight GPU buffers (Gemma 3 sandwich norm pattern)
   TVdxNormLayerWeights = record
     AttnNormGpu: TVdxGpuBuffer;       // F32 x HiddenDim, pre-attention norm
@@ -46,6 +53,29 @@ type
     FShaderModule: VkShaderModule;
     FBundle: TVdxComputePipelineBundle;
     FDescLayout: VkDescriptorSetLayout;
+    FDescPool: VkDescriptorPool;
+    FDescSet: VkDescriptorSet;
+
+    // Fused copy+norm pipeline (reads source, norms, writes dest)
+    FShaderModuleCopy: VkShaderModule;
+    FBundleCopy: TVdxComputePipelineBundle;
+    FDescLayoutCopy: VkDescriptorSetLayout;  // 3 bindings: source, weight, dest
+    FDescPoolCopy: VkDescriptorPool;
+    FDescSetCopy: VkDescriptorSet;
+
+    // Batched norm pipelines (Phase 6D — prefill batching)
+    // In-place batch: dispatch (num_tokens,1,1), reuses FDescLayout (2 bindings)
+    FShaderModuleBatch: VkShaderModule;
+    FBundleBatch: TVdxComputePipelineBundle;
+    FDescPoolBatch: VkDescriptorPool;
+    FDescSetBatch: VkDescriptorSet;
+
+    // Fused copy+norm batch: reuses FDescLayoutCopy (3 bindings)
+    FShaderModuleCopyBatch: VkShaderModule;
+    FBundleCopyBatch: TVdxComputePipelineBundle;
+    FDescPoolCopyBatch: VkDescriptorPool;
+    FDescSetCopyBatch: VkDescriptorSet;
+
     FEpsilon: Single;
 
   public
@@ -62,6 +92,21 @@ type
     // Apply RMSNorm in-place on residual using weight buffer
     procedure Apply(const AResidualBuf: TVdxGpuBuffer;
       const AWeightBuf: TVdxGpuBuffer; const AHiddenDim: UInt32);
+
+    // Fused copy+norm: read source, normalize, write to dest (source untouched)
+    procedure ApplyCopy(const ASourceBuf: TVdxGpuBuffer;
+      const AWeightBuf: TVdxGpuBuffer; const ADestBuf: TVdxGpuBuffer;
+      const AHiddenDim: UInt32);
+
+    // Batched in-place RMSNorm on matrix [NumTokens x HiddenDim]
+    procedure ApplyBatch(const AMatrixBuf: TVdxGpuBuffer;
+      const AWeightBuf: TVdxGpuBuffer; const AHiddenDim: UInt32;
+      const ANumTokens: UInt32);
+
+    // Batched fused copy+norm on matrices [NumTokens x HiddenDim]
+    procedure ApplyCopyBatch(const ASourceBuf: TVdxGpuBuffer;
+      const AWeightBuf: TVdxGpuBuffer; const ADestBuf: TVdxGpuBuffer;
+      const AHiddenDim: UInt32; const ANumTokens: UInt32);
 
     // Upload attn_norm + ffn_norm weights from GGUF to GPU for one layer
     procedure UploadNormWeights(const AReader: TVdxGGUFReader;
@@ -89,6 +134,24 @@ begin
   FBundle.Pipeline := VK_NULL_HANDLE;
   FBundle.PipelineLayout := VK_NULL_HANDLE;
   FDescLayout := VK_NULL_HANDLE;
+  FDescPool := VK_NULL_HANDLE;
+  FDescSet := VK_NULL_HANDLE;
+  FShaderModuleCopy := VK_NULL_HANDLE;
+  FBundleCopy.Pipeline := VK_NULL_HANDLE;
+  FBundleCopy.PipelineLayout := VK_NULL_HANDLE;
+  FDescLayoutCopy := VK_NULL_HANDLE;
+  FDescPoolCopy := VK_NULL_HANDLE;
+  FDescSetCopy := VK_NULL_HANDLE;
+  FShaderModuleBatch := VK_NULL_HANDLE;
+  FBundleBatch.Pipeline := VK_NULL_HANDLE;
+  FBundleBatch.PipelineLayout := VK_NULL_HANDLE;
+  FDescPoolBatch := VK_NULL_HANDLE;
+  FDescSetBatch := VK_NULL_HANDLE;
+  FShaderModuleCopyBatch := VK_NULL_HANDLE;
+  FBundleCopyBatch.Pipeline := VK_NULL_HANDLE;
+  FBundleCopyBatch.PipelineLayout := VK_NULL_HANDLE;
+  FDescPoolCopyBatch := VK_NULL_HANDLE;
+  FDescSetCopyBatch := VK_NULL_HANDLE;
   FEpsilon := 1e-6;
 end;
 
@@ -109,6 +172,7 @@ procedure TVdxLayerNorm.Init(const ACompute: TVdxVulkanCompute;
 var
   LSpvPath: string;
   LSpvData: TBytes;
+  LDummyBuf: TVdxGpuBuffer;
 begin
   FCompute := ACompute;
   FEpsilon := AEpsilon;
@@ -134,6 +198,76 @@ begin
   FBundle := FCompute.CreateComputePipelineWithPush(
     FShaderModule, 'main', FDescLayout, SizeOf(TVdxRMSNormPush));
 
+  // Pre-allocate reusable descriptor pool + set (eliminates per-Apply churn)
+  // 1 set, 2 storage buffer bindings (residual + weight)
+  LDummyBuf := Default(TVdxGpuBuffer);
+  FDescPool := FCompute.CreateDescriptorPoolForStorage(1, 2);
+  FDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPool, FDescLayout, [LDummyBuf, LDummyBuf]);
+
+  // Load fused copy+norm shader (source → norm → dest, no in-place)
+  LSpvPath := TPath.Combine(
+    TPath.GetDirectoryName(ParamStr(0)),
+    '..\shaders\rmsnorm_copy.spv'
+  );
+  LSpvPath := TPath.GetFullPath(LSpvPath);
+  TVdxUtils.FailIf(not TFile.Exists(LSpvPath),
+    'rmsnorm_copy.spv not found: %s', [LSpvPath]);
+  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  FShaderModuleCopy := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+
+  // 3-binding layout: source (readonly), weight (readonly), dest (writeonly)
+  FDescLayoutCopy := FCompute.CreateStorageDescriptorSetLayout(3);
+
+  // Pipeline with same push constants (hidden_dim + eps)
+  FBundleCopy := FCompute.CreateComputePipelineWithPush(
+    FShaderModuleCopy, 'main', FDescLayoutCopy, SizeOf(TVdxRMSNormPush));
+
+  // Pre-allocate reusable descriptor pool + set for fused shader
+  FDescPoolCopy := FCompute.CreateDescriptorPoolForStorage(1, 3);
+  FDescSetCopy := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPoolCopy, FDescLayoutCopy, [LDummyBuf, LDummyBuf, LDummyBuf]);
+
+  // --- Batched in-place norm (Phase 6D) ---
+  LSpvPath := TPath.Combine(
+    TPath.GetDirectoryName(ParamStr(0)),
+    '..\shaders\rmsnorm_batch.spv'
+  );
+  LSpvPath := TPath.GetFullPath(LSpvPath);
+  TVdxUtils.FailIf(not TFile.Exists(LSpvPath),
+    'rmsnorm_batch.spv not found: %s', [LSpvPath]);
+  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  FShaderModuleBatch := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+
+  // Reuse FDescLayout (2 bindings: matrix, weight)
+  FBundleBatch := FCompute.CreateComputePipelineWithPush(
+    FShaderModuleBatch, 'main', FDescLayout, SizeOf(TVdxRMSNormBatchPush));
+  FDescPoolBatch := FCompute.CreateDescriptorPoolForStorage(1, 2);
+  FDescSetBatch := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPoolBatch, FDescLayout, [LDummyBuf, LDummyBuf]);
+
+  // --- Batched fused copy+norm (Phase 6D) ---
+  LSpvPath := TPath.Combine(
+    TPath.GetDirectoryName(ParamStr(0)),
+    '..\shaders\rmsnorm_copy_batch.spv'
+  );
+  LSpvPath := TPath.GetFullPath(LSpvPath);
+  TVdxUtils.FailIf(not TFile.Exists(LSpvPath),
+    'rmsnorm_copy_batch.spv not found: %s', [LSpvPath]);
+  LSpvData := TFile.ReadAllBytes(LSpvPath);
+  FShaderModuleCopyBatch := FCompute.CreateShaderModule(
+    @LSpvData[0], NativeUInt(Length(LSpvData)));
+
+  // Reuse FDescLayoutCopy (3 bindings: source, weight, dest)
+  FBundleCopyBatch := FCompute.CreateComputePipelineWithPush(
+    FShaderModuleCopyBatch, 'main', FDescLayoutCopy,
+    SizeOf(TVdxRMSNormBatchPush));
+  FDescPoolCopyBatch := FCompute.CreateDescriptorPoolForStorage(1, 3);
+  FDescSetCopyBatch := FCompute.AllocateDescriptorSetForBuffers(
+    FDescPoolCopyBatch, FDescLayoutCopy, [LDummyBuf, LDummyBuf, LDummyBuf]);
+
   Status('LayerNorm: Ready');
 end;
 
@@ -147,6 +281,48 @@ begin
     Exit;
 
   FCompute.DestroyComputePipelineBundle(FBundle);
+
+  // Destroy fused copy+norm resources
+  FCompute.DestroyComputePipelineBundle(FBundleCopy);
+
+  // Destroy batched norm resources (Phase 6D)
+  FCompute.DestroyComputePipelineBundle(FBundleBatch);
+  if FDescPoolBatch <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyDescriptorPoolHandle(FDescPoolBatch);
+    FDescPoolBatch := VK_NULL_HANDLE;
+  end;
+  FCompute.DestroyShaderModuleHandle(FShaderModuleBatch);
+  FShaderModuleBatch := VK_NULL_HANDLE;
+
+  FCompute.DestroyComputePipelineBundle(FBundleCopyBatch);
+  if FDescPoolCopyBatch <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyDescriptorPoolHandle(FDescPoolCopyBatch);
+    FDescPoolCopyBatch := VK_NULL_HANDLE;
+  end;
+  FCompute.DestroyShaderModuleHandle(FShaderModuleCopyBatch);
+  FShaderModuleCopyBatch := VK_NULL_HANDLE;
+
+  if FDescPoolCopy <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyDescriptorPoolHandle(FDescPoolCopy);
+    FDescPoolCopy := VK_NULL_HANDLE;
+  end;
+
+  FCompute.DestroyDescriptorSetLayoutHandle(FDescLayoutCopy);
+  FDescLayoutCopy := VK_NULL_HANDLE;
+
+  FCompute.DestroyShaderModuleHandle(FShaderModuleCopy);
+  FShaderModuleCopy := VK_NULL_HANDLE;
+
+  // Destroy in-place norm resources
+  if FDescPool <> VK_NULL_HANDLE then
+  begin
+    FCompute.DestroyDescriptorPoolHandle(FDescPool);
+    FDescPool := VK_NULL_HANDLE;
+  end;
+
   FCompute.DestroyDescriptorSetLayoutHandle(FDescLayout);
   FDescLayout := VK_NULL_HANDLE;
 
@@ -164,32 +340,106 @@ procedure TVdxLayerNorm.Apply(const AResidualBuf: TVdxGpuBuffer;
   const AWeightBuf: TVdxGpuBuffer; const AHiddenDim: UInt32);
 var
   LPush: TVdxRMSNormPush;
-  LDescPool: VkDescriptorPool;
-  LDescSet: VkDescriptorSet;
 begin
-  // Create temporary descriptor pool + set for this dispatch
-  LDescPool := FCompute.CreateDescriptorPoolForStorage(1, 2);
-  try
-    LDescSet := FCompute.AllocateDescriptorSetForBuffers(
-      LDescPool, FDescLayout,
-      [AResidualBuf, AWeightBuf]
-    );
+  // Rebind buffers to pre-allocated descriptor set (no pool create/destroy)
+  FCompute.UpdateDescriptorSetBuffers(FDescSet, [AResidualBuf, AWeightBuf]);
 
-    LPush.HiddenDim := AHiddenDim;
-    LPush.Eps := FEpsilon;
+  LPush.HiddenDim := AHiddenDim;
+  LPush.Eps := FEpsilon;
 
-    // Single workgroup — all 2560 elements handled by 256 threads
-    FCompute.DispatchComputeWithPush(
-      FBundle.Pipeline,
-      FBundle.PipelineLayout,
-      LDescSet,
-      @LPush,
-      SizeOf(LPush),
-      1  // 1 workgroup
-    );
-  finally
-    FCompute.DestroyDescriptorPoolHandle(LDescPool);
-  end;
+  // Single workgroup — all 2560 elements handled by 256 threads
+  FCompute.DispatchComputeWithPush(
+    FBundle.Pipeline,
+    FBundle.PipelineLayout,
+    FDescSet,
+    @LPush,
+    SizeOf(LPush),
+    1  // 1 workgroup
+  );
+end;
+
+// ============================================================================
+//  TVdxLayerNorm — ApplyCopy: Fused read-source + RMSNorm + write-dest
+// ============================================================================
+
+procedure TVdxLayerNorm.ApplyCopy(const ASourceBuf: TVdxGpuBuffer;
+  const AWeightBuf: TVdxGpuBuffer; const ADestBuf: TVdxGpuBuffer;
+  const AHiddenDim: UInt32);
+var
+  LPush: TVdxRMSNormPush;
+begin
+  // Rebind buffers to pre-allocated fused descriptor set
+  FCompute.UpdateDescriptorSetBuffers(FDescSetCopy,
+    [ASourceBuf, AWeightBuf, ADestBuf]);
+
+  LPush.HiddenDim := AHiddenDim;
+  LPush.Eps := FEpsilon;
+
+  // Single workgroup — reads source, norms, writes dest
+  FCompute.DispatchComputeWithPush(
+    FBundleCopy.Pipeline,
+    FBundleCopy.PipelineLayout,
+    FDescSetCopy,
+    @LPush,
+    SizeOf(LPush),
+    1  // 1 workgroup
+  );
+end;
+
+// ============================================================================
+//  TVdxLayerNorm — ApplyBatch: in-place RMSNorm on matrix [N x HiddenDim]
+//  Dispatch (NumTokens, 1, 1) — one workgroup per row
+// ============================================================================
+
+procedure TVdxLayerNorm.ApplyBatch(const AMatrixBuf: TVdxGpuBuffer;
+  const AWeightBuf: TVdxGpuBuffer; const AHiddenDim: UInt32;
+  const ANumTokens: UInt32);
+var
+  LPush: TVdxRMSNormBatchPush;
+begin
+  FCompute.UpdateDescriptorSetBuffers(FDescSetBatch,
+    [AMatrixBuf, AWeightBuf]);
+
+  LPush.HiddenDim := AHiddenDim;
+  LPush.Eps := FEpsilon;
+  LPush.NumTokens := ANumTokens;
+
+  FCompute.DispatchComputeWithPush(
+    FBundleBatch.Pipeline,
+    FBundleBatch.PipelineLayout,
+    FDescSetBatch,
+    @LPush,
+    SizeOf(LPush),
+    ANumTokens  // one workgroup per token row
+  );
+end;
+
+// ============================================================================
+//  TVdxLayerNorm — ApplyCopyBatch: fused copy+norm on matrices [N x HiddenDim]
+//  Dispatch (NumTokens, 1, 1) — one workgroup per row
+// ============================================================================
+
+procedure TVdxLayerNorm.ApplyCopyBatch(const ASourceBuf: TVdxGpuBuffer;
+  const AWeightBuf: TVdxGpuBuffer; const ADestBuf: TVdxGpuBuffer;
+  const AHiddenDim: UInt32; const ANumTokens: UInt32);
+var
+  LPush: TVdxRMSNormBatchPush;
+begin
+  FCompute.UpdateDescriptorSetBuffers(FDescSetCopyBatch,
+    [ASourceBuf, AWeightBuf, ADestBuf]);
+
+  LPush.HiddenDim := AHiddenDim;
+  LPush.Eps := FEpsilon;
+  LPush.NumTokens := ANumTokens;
+
+  FCompute.DispatchComputeWithPush(
+    FBundleCopyBatch.Pipeline,
+    FBundleCopyBatch.PipelineLayout,
+    FDescSetCopyBatch,
+    @LPush,
+    SizeOf(LPush),
+    ANumTokens  // one workgroup per token row
+  );
 end;
 
 // ============================================================================

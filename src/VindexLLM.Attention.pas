@@ -64,6 +64,64 @@ type
     NumQHeads: UInt32;
     GqaRatio: UInt32;
   end;
+
+  // KV cache store push constants (scatter K/V heads into cache)
+  TVdxKVCacheStorePush = record
+    HeadDim: UInt32;
+    MaxSeq: UInt32;
+    Position: UInt32;
+    NumKVHeads: UInt32;
+  end;
+
+  // Batch matmul push constants (prefill: W x InputMatrix -> OutputMatrix)
+  TVdxMatMulPush = record
+    InDimParam: UInt32;   // in_dim/2 for F16, in_dim for Q8_0
+    OutDim: UInt32;
+    NumTokens: UInt32;
+  end;
+
+  // Batched RoPE push constants (Phase 6D prefill)
+  TVdxRoPEBatchPush = record
+    HeadDim: UInt32;
+    NumHeads: UInt32;
+    NumTokens: UInt32;
+    ThetaBase: Single;
+    StartPos: UInt32;
+  end;
+
+  // Batched KV cache store push constants (Phase 6D prefill)
+  TVdxKVCacheStoreBatchPush = record
+    HeadDim: UInt32;
+    MaxSeq: UInt32;
+    NumKVHeads: UInt32;
+    NumTokens: UInt32;
+    StartPos: UInt32;
+  end;
+
+  // Prefill attention scores push constants (Phase 6D)
+  TVdxAttnScoresPrefillPush = record
+    HeadDim: UInt32;
+    NumTokens: UInt32;
+    MaxSeq: UInt32;
+    Scale: Single;
+    NumQHeads: UInt32;
+    GqaRatio: UInt32;
+  end;
+
+  // Prefill softmax push constants (Phase 6D)
+  TVdxSoftmaxPrefillPush = record
+    NumTokens: UInt32;
+    NumQHeads: UInt32;
+  end;
+
+  // Prefill attention value push constants (Phase 6D)
+  TVdxAttnValuePrefillPush = record
+    HeadDim: UInt32;
+    NumTokens: UInt32;
+    MaxSeq: UInt32;
+    NumQHeads: UInt32;
+    GqaRatio: UInt32;
+  end;
 // ============================================================================
 //  Per-Layer Attention Weight GPU Buffers
 // ============================================================================
@@ -119,6 +177,42 @@ type
     FSoftmaxDescSet: VkDescriptorSet;
     FValueDescSet: VkDescriptorSet;
 
+    // KV cache store shader (replaces per-head CopyBufferRegion calls)
+    FKVStoreShader: VkShaderModule;
+    FKVStoreBundle: TVdxComputePipelineBundle;
+    FKVStoreDescLayout: VkDescriptorSetLayout;  // 4 bindings
+    FKVStoreDescPool: VkDescriptorPool;
+    FKVStoreDescSet: VkDescriptorSet;
+
+    // Batch matmul shaders + pipelines (prefill batching — Phase 6D)
+    FMatMulF16Shader: VkShaderModule;
+    FMatMulQ8Shader: VkShaderModule;
+    FMatMulF16Bundle: TVdxComputePipelineBundle;
+    FMatMulQ8Bundle: TVdxComputePipelineBundle;
+
+    // Prefill attention shaders + pipelines (Phase 6D)
+    FRoPEBatchShader: VkShaderModule;
+    FKVStoreBatchShader: VkShaderModule;
+    FScoresPrefillShader: VkShaderModule;
+    FSoftmaxPrefillShader: VkShaderModule;
+    FValuePrefillShader: VkShaderModule;
+    FRoPEBatchBundle: TVdxComputePipelineBundle;
+    FKVStoreBatchBundle: TVdxComputePipelineBundle;
+    FScoresPrefillBundle: TVdxComputePipelineBundle;
+    FSoftmaxPrefillBundle: TVdxComputePipelineBundle;
+    FValuePrefillBundle: TVdxComputePipelineBundle;
+
+    // Prefill descriptor pool + reusable sets (separate from single-token pool)
+    FPrefillDescPool: VkDescriptorPool;
+    FPrefillRoPEDescSet: VkDescriptorSet;       // 1 binding (data)
+    FPrefillKVStoreDescSet: VkDescriptorSet;    // 4 bindings (K, V, KCache, VCache)
+    FPrefillScoresDescSet: VkDescriptorSet;     // 3 bindings (Q, KCache, Scores)
+    FPrefillSoftmaxDescSet: VkDescriptorSet;    // 1 binding (Scores)
+    FPrefillValueDescSet: VkDescriptorSet;      // 3 bindings (Scores, VCache, Output)
+
+    // Pre-allocated prefill scores buffer [NumQHeads x MaxSeq x MaxSeq] F32
+    FPrefillScoresBuf: TVdxGpuBuffer;
+
     // Scratch buffers (reused every Forward call)
     FQBuf: TVdxGpuBuffer;        // [NumQHeads * HeadDim] F32
     FKBuf: TVdxGpuBuffer;        // [NumKVHeads * HeadDim] F32
@@ -143,6 +237,10 @@ type
       const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
       const AInDim: UInt32; const AOutDim: UInt32;
       const ATensorType: TVdxGGMLType);
+    procedure DispatchBatchMatMul(const AWeightBuf: TVdxGpuBuffer;
+      const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
+      const AInDim: UInt32; const AOutDim: UInt32;
+      const ANumTokens: UInt32; const ATensorType: TVdxGGMLType);
 
   public
     constructor Create(); override;
@@ -181,6 +279,30 @@ type
       const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
       const AInDim: UInt32; const AOutDim: UInt32;
       const ATensorType: TVdxGGMLType = gtF16);
+
+    // Batch matmul: W[OutDim x InDim] x Input[NumTokens x InDim] -> Out[NumTokens x OutDim]
+    // Used during batched prefill (Phase 6D). Must be called inside an active batch.
+    procedure BatchMatMul(const AWeightBuf: TVdxGpuBuffer;
+      const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
+      const AInDim: UInt32; const AOutDim: UInt32;
+      const ANumTokens: UInt32;
+      const ATensorType: TVdxGGMLType = gtF16);
+
+    // Batched attention for prefill: processes all N tokens through one layer.
+    // QMat/KMat/VMat: pre-normed projections [NumTokens x Dim], already allocated.
+    // AAttnOutMat: output [NumTokens x HiddenDim], caller adds to residual.
+    // Must be called inside an active batch (BeginBatch/EndBatch).
+    procedure ForwardBatch(const AInputMat: TVdxGpuBuffer;
+      const AWeights: TVdxAttnLayerWeights;
+      const AQNormBuf: TVdxGpuBuffer;
+      const AKNormBuf: TVdxGpuBuffer;
+      const ALayerIndex: Integer;
+      const ANumTokens: UInt32;
+      const AThetaBase: Single;
+      const AQMat: TVdxGpuBuffer;
+      const AKMat: TVdxGpuBuffer;
+      const AVMat: TVdxGpuBuffer;
+      const AAttnOutMat: TVdxGpuBuffer);
 
     // Diagnostic read-only access to internal buffers (for debugging tests)
     property ScoresBuf: TVdxGpuBuffer read FScoresBuf;
@@ -229,6 +351,32 @@ begin
   FAttnValueDescLayout := VK_NULL_HANDLE;
 
   FDescPool := VK_NULL_HANDLE;
+
+  FKVStoreShader := VK_NULL_HANDLE;
+  FKVStoreBundle.Pipeline := VK_NULL_HANDLE;
+  FKVStoreBundle.PipelineLayout := VK_NULL_HANDLE;
+  FKVStoreDescLayout := VK_NULL_HANDLE;
+  FKVStoreDescPool := VK_NULL_HANDLE;
+  FKVStoreDescSet := VK_NULL_HANDLE;
+
+  FMatMulF16Shader := VK_NULL_HANDLE;
+  FMatMulQ8Shader := VK_NULL_HANDLE;
+  FMatMulF16Bundle.Pipeline := VK_NULL_HANDLE;
+  FMatMulF16Bundle.PipelineLayout := VK_NULL_HANDLE;
+  FMatMulQ8Bundle.Pipeline := VK_NULL_HANDLE;
+  FMatMulQ8Bundle.PipelineLayout := VK_NULL_HANDLE;
+
+  FRoPEBatchShader := VK_NULL_HANDLE;
+  FKVStoreBatchShader := VK_NULL_HANDLE;
+  FScoresPrefillShader := VK_NULL_HANDLE;
+  FSoftmaxPrefillShader := VK_NULL_HANDLE;
+  FValuePrefillShader := VK_NULL_HANDLE;
+  FRoPEBatchBundle.Pipeline := VK_NULL_HANDLE;
+  FKVStoreBatchBundle.Pipeline := VK_NULL_HANDLE;
+  FScoresPrefillBundle.Pipeline := VK_NULL_HANDLE;
+  FSoftmaxPrefillBundle.Pipeline := VK_NULL_HANDLE;
+  FValuePrefillBundle.Pipeline := VK_NULL_HANDLE;
+  FPrefillDescPool := VK_NULL_HANDLE;
 end;
 destructor TVdxAttention.Destroy();
 begin
@@ -269,6 +417,7 @@ procedure TVdxAttention.Init(const ACompute: TVdxVulkanCompute;
 var
   LI: Integer;
   LCacheSize: UInt64;
+  LDummyBuf: TVdxGpuBuffer;
 begin
   FCompute := ACompute;
   FHiddenDim := AHiddenDim;
@@ -379,6 +528,74 @@ begin
         or VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   end;
+
+  // KV cache store shader — replaces per-head CopyBufferRegion with single dispatch
+  FKVStoreShader := LoadShader('kv_cache_store.spv');
+  FKVStoreDescLayout := FCompute.CreateStorageDescriptorSetLayout(4);
+  FKVStoreBundle := FCompute.CreateComputePipelineWithPush(
+    FKVStoreShader, 'main', FKVStoreDescLayout, SizeOf(TVdxKVCacheStorePush));
+
+  // Pre-allocate descriptor pool + set (4 bindings: KBuf, VBuf, KCache, VCache)
+  LDummyBuf := Default(TVdxGpuBuffer);
+  FKVStoreDescPool := FCompute.CreateDescriptorPoolForStorage(1, 4);
+  FKVStoreDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FKVStoreDescPool, FKVStoreDescLayout,
+    [LDummyBuf, LDummyBuf, LDummyBuf, LDummyBuf]);
+
+  // Batch matmul shaders + pipelines (Phase 6D — prefill batching)
+  // Reuse FMatVecDescLayout (3 storage bindings: weight, input, output)
+  FMatMulF16Shader := LoadShader('matmul_f16.spv');
+  FMatMulQ8Shader := LoadShader('matmul_q8_0.spv');
+  FMatMulF16Bundle := FCompute.CreateComputePipelineWithPush(
+    FMatMulF16Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatMulPush));
+  FMatMulQ8Bundle := FCompute.CreateComputePipelineWithPush(
+    FMatMulQ8Shader, 'main', FMatVecDescLayout, SizeOf(TVdxMatMulPush));
+
+  // --- Prefill attention shaders + pipelines (Phase 6D) ---
+  FRoPEBatchShader := LoadShader('rope_batch.spv');
+  FKVStoreBatchShader := LoadShader('kv_cache_store_batch.spv');
+  FScoresPrefillShader := LoadShader('attn_scores_prefill.spv');
+  FSoftmaxPrefillShader := LoadShader('softmax_prefill.spv');
+  FValuePrefillShader := LoadShader('attn_value_prefill.spv');
+
+  // Reuse existing descriptor set layouts (same binding counts)
+  FRoPEBatchBundle := FCompute.CreateComputePipelineWithPush(
+    FRoPEBatchShader, 'main', FRoPEDescLayout,
+    SizeOf(TVdxRoPEBatchPush));
+  FKVStoreBatchBundle := FCompute.CreateComputePipelineWithPush(
+    FKVStoreBatchShader, 'main', FKVStoreDescLayout,
+    SizeOf(TVdxKVCacheStoreBatchPush));
+  FScoresPrefillBundle := FCompute.CreateComputePipelineWithPush(
+    FScoresPrefillShader, 'main', FAttnScoresDescLayout,
+    SizeOf(TVdxAttnScoresPrefillPush));
+  FSoftmaxPrefillBundle := FCompute.CreateComputePipelineWithPush(
+    FSoftmaxPrefillShader, 'main', FSoftmaxDescLayout,
+    SizeOf(TVdxSoftmaxPrefillPush));
+  FValuePrefillBundle := FCompute.CreateComputePipelineWithPush(
+    FValuePrefillShader, 'main', FAttnValueDescLayout,
+    SizeOf(TVdxAttnValuePrefillPush));
+
+  // Prefill descriptor pool: 5 sets, total bindings = 1+4+3+1+3 = 12
+  FPrefillDescPool := FCompute.CreateDescriptorPoolForStorage(5, 12);
+  FPrefillRoPEDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FPrefillDescPool, FRoPEDescLayout, [FQBuf]);
+  FPrefillKVStoreDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FPrefillDescPool, FKVStoreDescLayout,
+    [LDummyBuf, LDummyBuf, LDummyBuf, LDummyBuf]);
+  FPrefillScoresDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FPrefillDescPool, FAttnScoresDescLayout,
+    [LDummyBuf, LDummyBuf, LDummyBuf]);
+  FPrefillSoftmaxDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FPrefillDescPool, FSoftmaxDescLayout, [LDummyBuf]);
+  FPrefillValueDescSet := FCompute.AllocateDescriptorSetForBuffers(
+    FPrefillDescPool, FAttnValueDescLayout,
+    [LDummyBuf, LDummyBuf, LDummyBuf]);
+
+  // Pre-allocated prefill scores buffer [NumQHeads x MaxSeq x MaxSeq] F32
+  FPrefillScoresBuf := FCompute.CreateGpuBuffer(
+    UInt64(FNumQHeads) * FMaxSeqLen * FMaxSeqLen * SizeOf(Single),
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 end;
 // ============================================================================
 //  TVdxAttention — Cleanup
@@ -421,6 +638,35 @@ begin
   FCompute.DestroyComputePipelineBundle(FAttnScoresMHBundle);
   FCompute.DestroyComputePipelineBundle(FSoftmaxMHBundle);
   FCompute.DestroyComputePipelineBundle(FAttnValueMHBundle);
+
+  // Destroy KV cache store resources
+  FCompute.DestroyComputePipelineBundle(FKVStoreBundle);
+  if FKVStoreDescPool <> VK_NULL_HANDLE then
+    FCompute.DestroyDescriptorPoolHandle(FKVStoreDescPool);
+  FCompute.DestroyDescriptorSetLayoutHandle(FKVStoreDescLayout);
+  FCompute.DestroyShaderModuleHandle(FKVStoreShader);
+
+  // Destroy batch matmul pipelines + shaders (Phase 6D)
+  FCompute.DestroyComputePipelineBundle(FMatMulF16Bundle);
+  FCompute.DestroyComputePipelineBundle(FMatMulQ8Bundle);
+  FCompute.DestroyShaderModuleHandle(FMatMulF16Shader);
+  FCompute.DestroyShaderModuleHandle(FMatMulQ8Shader);
+
+  // Destroy prefill attention resources (Phase 6D)
+  if FPrefillScoresBuf.Buffer <> VK_NULL_HANDLE then
+    FCompute.DestroyGpuBuffer(FPrefillScoresBuf);
+  if FPrefillDescPool <> VK_NULL_HANDLE then
+    FCompute.DestroyDescriptorPoolHandle(FPrefillDescPool);
+  FCompute.DestroyComputePipelineBundle(FRoPEBatchBundle);
+  FCompute.DestroyComputePipelineBundle(FKVStoreBatchBundle);
+  FCompute.DestroyComputePipelineBundle(FScoresPrefillBundle);
+  FCompute.DestroyComputePipelineBundle(FSoftmaxPrefillBundle);
+  FCompute.DestroyComputePipelineBundle(FValuePrefillBundle);
+  FCompute.DestroyShaderModuleHandle(FRoPEBatchShader);
+  FCompute.DestroyShaderModuleHandle(FKVStoreBatchShader);
+  FCompute.DestroyShaderModuleHandle(FScoresPrefillShader);
+  FCompute.DestroyShaderModuleHandle(FSoftmaxPrefillShader);
+  FCompute.DestroyShaderModuleHandle(FValuePrefillShader);
 
   // Destroy pre-allocated descriptor pool (frees all 6 sets automatically)
   if FDescPool <> VK_NULL_HANDLE then
@@ -500,6 +746,204 @@ procedure TVdxAttention.TestMatVec(const AWeightBuf: TVdxGpuBuffer;
   const ATensorType: TVdxGGMLType);
 begin
   DispatchMatVec(AWeightBuf, AInputBuf, AOutputBuf, AInDim, AOutDim, ATensorType);
+end;
+
+// ============================================================================
+//  TVdxAttention — DispatchBatchMatMul: batched matrix multiply for prefill
+//  W[OutDim x InDim] x Input[NumTokens x InDim] -> Output[NumTokens x OutDim]
+//  2D dispatch: (OutDim, NumTokens) workgroups — each does one dot product
+// ============================================================================
+
+procedure TVdxAttention.DispatchBatchMatMul(const AWeightBuf: TVdxGpuBuffer;
+  const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
+  const AInDim: UInt32; const AOutDim: UInt32;
+  const ANumTokens: UInt32; const ATensorType: TVdxGGMLType);
+var
+  LPush: TVdxMatMulPush;
+  LPipeline: VkPipeline;
+  LPipelineLayout: VkPipelineLayout;
+begin
+  // Rebind buffers to pre-allocated descriptor set (same 3-binding layout as matvec)
+  FCompute.UpdateDescriptorSetBuffers(FMatVecDescSet,
+    [AWeightBuf, AInputBuf, AOutputBuf]);
+
+  // Select pipeline and set dimension parameter
+  if ATensorType = gtQ8_0 then
+  begin
+    LPush.InDimParam := AInDim;
+    LPipeline := FMatMulQ8Bundle.Pipeline;
+    LPipelineLayout := FMatMulQ8Bundle.PipelineLayout;
+  end
+  else
+  begin
+    LPush.InDimParam := AInDim div 2;
+    LPipeline := FMatMulF16Bundle.Pipeline;
+    LPipelineLayout := FMatMulF16Bundle.PipelineLayout;
+  end;
+
+  LPush.OutDim := AOutDim;
+  LPush.NumTokens := ANumTokens;
+
+  // 2D dispatch: X = output rows (OutDim), Y = tokens (NumTokens)
+  FCompute.DispatchComputeWithPush(
+    LPipeline, LPipelineLayout,
+    FMatVecDescSet, @LPush, SizeOf(LPush),
+    AOutDim, ANumTokens);
+end;
+
+// ============================================================================
+//  TVdxAttention — BatchMatMul: Public wrapper for batched matrix multiply
+// ============================================================================
+
+procedure TVdxAttention.BatchMatMul(const AWeightBuf: TVdxGpuBuffer;
+  const AInputBuf: TVdxGpuBuffer; const AOutputBuf: TVdxGpuBuffer;
+  const AInDim: UInt32; const AOutDim: UInt32;
+  const ANumTokens: UInt32; const ATensorType: TVdxGGMLType);
+begin
+  DispatchBatchMatMul(AWeightBuf, AInputBuf, AOutputBuf,
+    AInDim, AOutDim, ANumTokens, ATensorType);
+end;
+
+// ============================================================================
+//  TVdxAttention — ForwardBatch: batched attention for prefill (Phase 6D)
+//  Processes all NumTokens through one layer simultaneously.
+//  AInputMat: pre-normed input [NumTokens x HiddenDim]
+//  AQMat/AKMat/AVMat: scratch matrices (caller-allocated)
+//  AAttnOutMat: output [NumTokens x HiddenDim]
+// ============================================================================
+
+procedure TVdxAttention.ForwardBatch(const AInputMat: TVdxGpuBuffer;
+  const AWeights: TVdxAttnLayerWeights;
+  const AQNormBuf: TVdxGpuBuffer;
+  const AKNormBuf: TVdxGpuBuffer;
+  const ALayerIndex: Integer;
+  const ANumTokens: UInt32;
+  const AThetaBase: Single;
+  const AQMat: TVdxGpuBuffer;
+  const AKMat: TVdxGpuBuffer;
+  const AVMat: TVdxGpuBuffer;
+  const AAttnOutMat: TVdxGpuBuffer);
+var
+  LQKNormPush: TVdxQKNormPush;
+  LRoPEPush: TVdxRoPEBatchPush;
+  LKVStorePush: TVdxKVCacheStoreBatchPush;
+  LScoresPush: TVdxAttnScoresPrefillPush;
+  LSoftmaxPush: TVdxSoftmaxPrefillPush;
+  LValuePush: TVdxAttnValuePrefillPush;
+begin
+  // ---- Step 1: Q/K/V projections (batch matmul) ----
+  DispatchBatchMatMul(AWeights.QWeightGpu, AInputMat, AQMat,
+    FHiddenDim, FNumQHeads * FHeadDim, ANumTokens, AWeights.WeightType);
+  DispatchBatchMatMul(AWeights.KWeightGpu, AInputMat, AKMat,
+    FHiddenDim, FNumKVHeads * FHeadDim, ANumTokens, AWeights.WeightType);
+  DispatchBatchMatMul(AWeights.VWeightGpu, AInputMat, AVMat,
+    FHiddenDim, FNumKVHeads * FHeadDim, ANumTokens, AWeights.WeightType);
+  FCompute.BatchBarrier(); // Q/K/V matrices ready
+
+  // ---- Step 2: QK-norm (reuse existing shader with NumHeads * NumTokens) ----
+  // QMat is [N x NumQHeads x HeadDim] flat = [N*NumQHeads x HeadDim]
+  LQKNormPush.HeadDim := FHeadDim;
+  LQKNormPush.Eps := 1e-6;
+
+  LQKNormPush.NumHeads := FNumQHeads * ANumTokens;
+  FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [AQMat, AQNormBuf]);
+  FCompute.DispatchComputeWithPush(
+    FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
+    FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush),
+    FNumQHeads * ANumTokens);
+
+  LQKNormPush.NumHeads := FNumKVHeads * ANumTokens;
+  FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [AKMat, AKNormBuf]);
+  FCompute.DispatchComputeWithPush(
+    FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
+    FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush),
+    FNumKVHeads * ANumTokens);
+  FCompute.BatchBarrier(); // Q/K normed
+
+  // ---- Step 3: Batched RoPE (per-token positions 0..N-1) ----
+  LRoPEPush.HeadDim := FHeadDim;
+  LRoPEPush.ThetaBase := AThetaBase;
+  LRoPEPush.StartPos := 0;
+
+  // RoPE on Q: dispatch 2D (NumQHeads, NumTokens)
+  LRoPEPush.NumHeads := FNumQHeads;
+  LRoPEPush.NumTokens := ANumTokens;
+  FCompute.UpdateDescriptorSetBuffers(FPrefillRoPEDescSet, [AQMat]);
+  FCompute.DispatchComputeWithPush(
+    FRoPEBatchBundle.Pipeline, FRoPEBatchBundle.PipelineLayout,
+    FPrefillRoPEDescSet, @LRoPEPush, SizeOf(LRoPEPush),
+    FNumQHeads, ANumTokens);
+
+  // RoPE on K: dispatch 2D (NumKVHeads, NumTokens)
+  LRoPEPush.NumHeads := FNumKVHeads;
+  FCompute.UpdateDescriptorSetBuffers(FPrefillRoPEDescSet, [AKMat]);
+  FCompute.DispatchComputeWithPush(
+    FRoPEBatchBundle.Pipeline, FRoPEBatchBundle.PipelineLayout,
+    FPrefillRoPEDescSet, @LRoPEPush, SizeOf(LRoPEPush),
+    FNumKVHeads, ANumTokens);
+  FCompute.BatchBarrier(); // Q/K with RoPE applied
+
+  // ---- Step 4: Store K and V into cache (all positions at once) ----
+  LKVStorePush.HeadDim := FHeadDim;
+  LKVStorePush.MaxSeq := FMaxSeqLen;
+  LKVStorePush.NumKVHeads := FNumKVHeads;
+  LKVStorePush.NumTokens := ANumTokens;
+  LKVStorePush.StartPos := 0;
+  FCompute.UpdateDescriptorSetBuffers(FPrefillKVStoreDescSet,
+    [AKMat, AVMat, FKCache[ALayerIndex], FVCache[ALayerIndex]]);
+  FCompute.DispatchComputeWithPush(
+    FKVStoreBatchBundle.Pipeline, FKVStoreBatchBundle.PipelineLayout,
+    FPrefillKVStoreDescSet, @LKVStorePush, SizeOf(LKVStorePush),
+    FNumKVHeads, ANumTokens);
+  FCompute.BatchBarrier(); // KV cache filled
+
+  // ---- Step 5: Prefill attention (scores + softmax + value) ----
+
+  // 5a. Causal attention scores: 3D dispatch (keys, heads, queries)
+  LScoresPush.HeadDim := FHeadDim;
+  LScoresPush.NumTokens := ANumTokens;
+  LScoresPush.MaxSeq := FMaxSeqLen;
+  LScoresPush.Scale := 1.0 / Sqrt(Single(FHeadDim));
+  LScoresPush.NumQHeads := FNumQHeads;
+  LScoresPush.GqaRatio := FNumQHeads div FNumKVHeads;
+  FCompute.UpdateDescriptorSetBuffers(FPrefillScoresDescSet,
+    [AQMat, FKCache[ALayerIndex], FPrefillScoresBuf]);
+  FCompute.DispatchComputeWithPush(
+    FScoresPrefillBundle.Pipeline, FScoresPrefillBundle.PipelineLayout,
+    FPrefillScoresDescSet, @LScoresPush, SizeOf(LScoresPush),
+    (ANumTokens + 255) div 256, FNumQHeads, ANumTokens);
+  FCompute.BatchBarrier(); // Scores ready for softmax
+
+  // 5b. Softmax: 2D dispatch (heads, queries)
+  LSoftmaxPush.NumTokens := ANumTokens;
+  LSoftmaxPush.NumQHeads := FNumQHeads;
+  FCompute.UpdateDescriptorSetBuffers(FPrefillSoftmaxDescSet,
+    [FPrefillScoresBuf]);
+  FCompute.DispatchComputeWithPush(
+    FSoftmaxPrefillBundle.Pipeline, FSoftmaxPrefillBundle.PipelineLayout,
+    FPrefillSoftmaxDescSet, @LSoftmaxPush, SizeOf(LSoftmaxPush),
+    FNumQHeads, ANumTokens);
+  FCompute.BatchBarrier(); // Attention weights ready
+
+  // 5c. Value weighted sum: 3D dispatch (dim, heads, queries)
+  LValuePush.HeadDim := FHeadDim;
+  LValuePush.NumTokens := ANumTokens;
+  LValuePush.MaxSeq := FMaxSeqLen;
+  LValuePush.NumQHeads := FNumQHeads;
+  LValuePush.GqaRatio := FNumQHeads div FNumKVHeads;
+  FCompute.UpdateDescriptorSetBuffers(FPrefillValueDescSet,
+    [FPrefillScoresBuf, FVCache[ALayerIndex], AQMat]);
+  FCompute.DispatchComputeWithPush(
+    FValuePrefillBundle.Pipeline, FValuePrefillBundle.PipelineLayout,
+    FPrefillValueDescSet, @LValuePush, SizeOf(LValuePush),
+    (FHeadDim + 255) div 256, FNumQHeads, ANumTokens);
+  FCompute.BatchBarrier(); // AQMat has value output [N x QDim]
+
+  // ---- Step 6: Output projection (batch matmul) ----
+  // O: W[QDim x HiddenDim] x AQMat[N x QDim] -> AAttnOutMat[N x HiddenDim]
+  DispatchBatchMatMul(AWeights.OWeightGpu, AQMat, AAttnOutMat,
+    FNumQHeads * FHeadDim, FHiddenDim, ANumTokens, AWeights.WeightType);
+  FCompute.BatchBarrier(); // AAttnOutMat ready for caller
 end;
 // ============================================================================
 //  TVdxAttention — Upload Attention Weights from GGUF
@@ -610,18 +1054,15 @@ procedure TVdxAttention.Forward(const AInputBuf: TVdxGpuBuffer;
   const AOutputBuf: TVdxGpuBuffer);
 var
   LSeqLen: UInt32;
-  LKVHead: UInt32;
-  LHeadBytes: UInt64;
-  LKVHeadBytes: UInt64;
   LQKNormPush: TVdxQKNormPush;
   LRoPEPush: TVdxRoPEPush;
   LScoresMHPush: TVdxAttnScoresMHPush;
   LSoftmaxMHPush: TVdxSoftmaxMHPush;
   LValueMHPush: TVdxAttnValueMHPush;
+  LKVStorePush: TVdxKVCacheStorePush;
 begin
   LSeqLen := UInt32(APosition) + 1;
-  LHeadBytes := UInt64(FHeadDim) * SizeOf(Single);
-  LKVHeadBytes := UInt64(FMaxSeqLen) * FHeadDim * SizeOf(Single);
+
   // ---- Step 1: Q/K/V projections (matvec — F16 or Q4_0) ----
   // All three read AInputBuf and write separate output buffers → independent
   DispatchMatVec(AWeights.QWeightGpu, AInputBuf, FQBuf,
@@ -670,26 +1111,17 @@ begin
     FRoPEDescSet, @LRoPEPush, SizeOf(LRoPEPush), FNumKVHeads);
   FCompute.BatchBarrier(); // Q/KBuf with RoPE applied, ready for KV cache + attn
   // ---- Step 4: Store K and V in KV cache at current position ----
-  // Cache layout: [NumKVHeads × MaxSeqLen × HeadDim]
-  // For each KV head h, copy HeadDim floats from K/VBuf to cache
-  for LKVHead := 0 to FNumKVHeads - 1 do
-  begin
-    // Source: FKBuf at offset h * HeadDim * sizeof(float)
-    // Dest: KCache at offset (h * MaxSeqLen + position) * HeadDim * sizeof(float)
-    FCompute.CopyBufferRegion(
-      FKBuf,
-      UInt64(LKVHead) * LHeadBytes,
-      FKCache[ALayerIndex],
-      (UInt64(LKVHead) * FMaxSeqLen + UInt64(APosition)) * FHeadDim * SizeOf(Single),
-      LHeadBytes);
-
-    FCompute.CopyBufferRegion(
-      FVBuf,
-      UInt64(LKVHead) * LHeadBytes,
-      FVCache[ALayerIndex],
-      (UInt64(LKVHead) * FMaxSeqLen + UInt64(APosition)) * FHeadDim * SizeOf(Single),
-      LHeadBytes);
-  end;
+  // Single dispatch scatters all KV heads into cache (replaces 8 CopyBufferRegion calls)
+  LKVStorePush.HeadDim := FHeadDim;
+  LKVStorePush.MaxSeq := FMaxSeqLen;
+  LKVStorePush.Position := UInt32(APosition);
+  LKVStorePush.NumKVHeads := FNumKVHeads;
+  FCompute.UpdateDescriptorSetBuffers(FKVStoreDescSet,
+    [FKBuf, FVBuf, FKCache[ALayerIndex], FVCache[ALayerIndex]]);
+  FCompute.DispatchComputeWithPush(
+    FKVStoreBundle.Pipeline, FKVStoreBundle.PipelineLayout,
+    FKVStoreDescSet, @LKVStorePush, SizeOf(LKVStorePush),
+    FNumKVHeads);  // 4 workgroups, one per KV head
   FCompute.BatchBarrier(); // KV cache updated, ready for attention scores
   // ---- Step 5: Multi-head attention (all heads in 3 dispatches) ----
 

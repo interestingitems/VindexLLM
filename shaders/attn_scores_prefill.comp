@@ -1,0 +1,77 @@
+#version 450
+
+// Prefill Attention Scores: compute Q*K^T with causal mask for all positions.
+// For each (q_head, q_pos, k_pos):
+//   if k_pos <= q_pos: score = dot(Q, K) * scale
+//   else: score = -1e30 (causal mask, will become 0 after softmax)
+//
+// Q layout: [NumTokens x NumQHeads x HeadDim], row-major
+//   Q[q_pos][q_head] at offset: q_pos * NumQHeads * HeadDim + q_head * HeadDim
+// K cache layout: [NumKVHeads x MaxSeq x HeadDim]
+//   K[kv_head][k_pos] at offset: kv_head * MaxSeq * HeadDim + k_pos * HeadDim
+// Scores layout: [NumQHeads x NumTokens x NumTokens]
+//   scores[q_head][q_pos][k_pos] at: q_head * N * N + q_pos * N + k_pos
+//
+// Dispatch 3D: (ceil(NumTokens / 256), NumQHeads, NumTokens)
+//   X = key position (thread-per-key), Y = query head, Z = query position
+//
+// Bindings:
+//   0 = Q matrix (float[], readonly)
+//   1 = K cache  (float[], readonly)
+//   2 = scores   (float[], writeonly)
+//
+// Push constants:
+//   head_dim, num_tokens, max_seq, scale, num_q_heads, gqa_ratio
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  head_dim;
+    uint  num_tokens;
+    uint  max_seq;
+    float scale;
+    uint  num_q_heads;
+    uint  gqa_ratio;
+} pc;
+
+layout(std430, binding = 0) readonly buffer QBuf {
+    float q_mat[];
+};
+
+layout(std430, binding = 1) readonly buffer KCacheBuf {
+    float k_cache[];
+};
+
+layout(std430, binding = 2) writeonly buffer ScoresBuf {
+    float scores[];
+};
+
+void main() {
+    uint k_pos = gl_GlobalInvocationID.x;
+    uint q_head = gl_WorkGroupID.y;
+    uint q_pos = gl_WorkGroupID.z;
+
+    if (k_pos >= pc.num_tokens || q_head >= pc.num_q_heads)
+        return;
+
+    uint N = pc.num_tokens;
+    uint score_idx = q_head * N * N + q_pos * N + k_pos;
+
+    // Causal mask: future keys are masked out
+    if (k_pos > q_pos) {
+        scores[score_idx] = -1.0e30;
+        return;
+    }
+
+    // Compute dot product Q[q_pos][q_head] . K[kv_head][k_pos]
+    uint kv_head = q_head / pc.gqa_ratio;
+    uint q_off = (q_pos * pc.num_q_heads + q_head) * pc.head_dim;
+    uint k_off = (kv_head * pc.max_seq + k_pos) * pc.head_dim;
+
+    float acc = 0.0;
+    for (uint d = 0; d < pc.head_dim; d++) {
+        acc += q_mat[q_off + d] * k_cache[k_off + d];
+    }
+
+    scores[score_idx] = acc * pc.scale;
+}
