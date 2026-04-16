@@ -27,14 +27,15 @@ uses
   VindexLLM.Inference in '..\src\VindexLLM.Inference.pas',
   VindexLLM.LayerNorm in '..\src\VindexLLM.LayerNorm.pas',
   VindexLLM.Resources in '..\src\VindexLLM.Resources.pas',
+  VindexLLM.Sampler in '..\src\VindexLLM.Sampler.pas',
   VindexLLM.Shaders in '..\src\VindexLLM.Shaders.pas',
   VindexLLM.Tokenizer in '..\src\VindexLLM.Tokenizer.pas',
+  VindexLLM.TokenWriter in '..\src\VindexLLM.TokenWriter.pas',
   VindexLLM.TOML in '..\src\VindexLLM.TOML.pas',
   VindexLLM.TurboQuant in '..\src\VindexLLM.TurboQuant.pas',
   VindexLLM.Utils in '..\src\VindexLLM.Utils.pas',
   VindexLLM.VirtualBuffer in '..\src\VindexLLM.VirtualBuffer.pas',
-  VindexLLM.Vulkan in '..\src\VindexLLM.Vulkan.pas',
-  VindexLLM.Sampler in '..\src\VindexLLM.Sampler.pas';
+  VindexLLM.Vulkan in '..\src\VindexLLM.Vulkan.pas';
 
 begin
   RunVdxTestbed();

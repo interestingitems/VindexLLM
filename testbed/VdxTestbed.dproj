@@ -119,14 +119,15 @@
         <DCCReference Include="..\src\VindexLLM.Inference.pas"/>
         <DCCReference Include="..\src\VindexLLM.LayerNorm.pas"/>
         <DCCReference Include="..\src\VindexLLM.Resources.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Sampler.pas"/>
         <DCCReference Include="..\src\VindexLLM.Shaders.pas"/>
         <DCCReference Include="..\src\VindexLLM.Tokenizer.pas"/>
+        <DCCReference Include="..\src\VindexLLM.TokenWriter.pas"/>
         <DCCReference Include="..\src\VindexLLM.TOML.pas"/>
         <DCCReference Include="..\src\VindexLLM.TurboQuant.pas"/>
         <DCCReference Include="..\src\VindexLLM.Utils.pas"/>
         <DCCReference Include="..\src\VindexLLM.VirtualBuffer.pas"/>
         <DCCReference Include="..\src\VindexLLM.Vulkan.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Sampler.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>
