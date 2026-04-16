@@ -12,12 +12,18 @@ if %ERRORLEVEL% NEQ 0 ( echo FAILED: matvec_f16.comp & exit /b 1 )
 %GLSLC% -V matvec_q8_0.comp -o matvec_q8_0.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: matvec_q8_0.comp & exit /b 1 )
 
+%GLSLC% -V matvec_q4_0.comp -o matvec_q4_0.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: matvec_q4_0.comp & exit /b 1 )
+
 rem === Matrix-matrix (batched prefill) ===
 %GLSLC% -V matmul_f16.comp -o matmul_f16.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: matmul_f16.comp & exit /b 1 )
 
 %GLSLC% -V matmul_q8_0.comp -o matmul_q8_0.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: matmul_q8_0.comp & exit /b 1 )
+
+%GLSLC% -V matmul_q4_0.comp -o matmul_q4_0.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: matmul_q4_0.comp & exit /b 1 )
 
 rem === RMSNorm ===
 %GLSLC% -V rmsnorm.comp -o rmsnorm.spv
@@ -76,11 +82,17 @@ if %ERRORLEVEL% NEQ 0 ( echo FAILED: embed_lookup_f16.comp & exit /b 1 )
 %GLSLC% -V embed_lookup_q8.comp -o embed_lookup_q8.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: embed_lookup_q8.comp & exit /b 1 )
 
+%GLSLC% -V embed_lookup_q4_0.comp -o embed_lookup_q4_0.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: embed_lookup_q4_0.comp & exit /b 1 )
+
 %GLSLC% -V embed_lookup_batch_f16.comp -o embed_lookup_batch_f16.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: embed_lookup_batch_f16.comp & exit /b 1 )
 
 %GLSLC% -V embed_lookup_batch_q8.comp -o embed_lookup_batch_q8.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: embed_lookup_batch_q8.comp & exit /b 1 )
+
+%GLSLC% -V embed_lookup_batch_q4_0.comp -o embed_lookup_batch_q4_0.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: embed_lookup_batch_q4_0.comp & exit /b 1 )
 
 rem === TurboQuant (TQ3 KV cache compression) ===
 %GLSLC% -V tq3_quantize.comp -o tq3_quantize.spv

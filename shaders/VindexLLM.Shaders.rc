@@ -4,10 +4,12 @@
 // Matrix-vector (single token generation)
 MATVEC_F16              RCDATA "matvec_f16.spv"
 MATVEC_Q8_0             RCDATA "matvec_q8_0.spv"
+MATVEC_Q4_0             RCDATA "matvec_q4_0.spv"
 
 // Matrix-matrix (batched prefill)
 MATMUL_F16              RCDATA "matmul_f16.spv"
 MATMUL_Q8_0             RCDATA "matmul_q8_0.spv"
+MATMUL_Q4_0             RCDATA "matmul_q4_0.spv"
 
 // RMSNorm (single token)
 RMSNORM                 RCDATA "rmsnorm.spv"
@@ -39,10 +41,12 @@ KV_CACHE_STORE_BATCH    RCDATA "kv_cache_store_batch.spv"
 // Embedding lookup (single token)
 EMBED_LOOKUP_F16        RCDATA "embed_lookup_f16.spv"
 EMBED_LOOKUP_Q8         RCDATA "embed_lookup_q8.spv"
+EMBED_LOOKUP_Q4_0       RCDATA "embed_lookup_q4_0.spv"
 
 // Embedding lookup (batched prefill)
 EMBED_LOOKUP_BATCH_F16  RCDATA "embed_lookup_batch_f16.spv"
 EMBED_LOOKUP_BATCH_Q8   RCDATA "embed_lookup_batch_q8.spv"
+EMBED_LOOKUP_BATCH_Q4_0 RCDATA "embed_lookup_batch_q4_0.spv"
 
 // TurboQuant (TQ3 KV cache compression)
 TQ3_QUANTIZE            RCDATA "tq3_quantize.spv"
