@@ -1152,6 +1152,245 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Test08_VectorSearchRoundtrip — end-to-end exercise of TVdxMemory.SearchVector.
+// Loads EmbeddingGemma, opens a fresh SQLite DB, attaches the embedder, writes
+// 10 turns (5 color-themed RELATED + 5 math-themed UNRELATED), issues a
+// semantic query and asserts that all five top-5 hits come from the related
+// cluster. Also verifies cosine-DESC ordering, ATopK=0 empty-return semantics,
+// BLOB persistence across close/reopen, and that SearchVector raises after
+// DetachEmbeddings. DB file is cleaned up on the way in and on the way out.
+// ---------------------------------------------------------------------------
+procedure Test08_VectorSearchRoundtrip();
+const
+  CModelPath = 'C:\Dev\LLM\GGUF\embeddinggemma-300m-qat-Q8_0.gguf';
+  CDbFile    = 'test_vector.db';
+
+  // 10 turns, alternating user/assistant. Even indices (0,2,4,6,8) are
+  // RELATED (colors, hues, lavender, violet); odd indices (1,3,5,7,9)
+  // are UNRELATED (math, physics). Balanced 5/5 so the top-5 test is
+  // a clean boundary assertion.
+  CTurnRoles: array[0..9] of string = (
+    'user', 'assistant', 'user', 'assistant', 'user',
+    'assistant', 'user', 'assistant', 'user', 'assistant'
+  );
+  CTurnTexts: array[0..9] of string = (
+    'My favorite color is deep purple.',
+    'The derivative of x squared is two x.',
+    'She painted the walls a soft lavender shade.',
+    'An electron has negative charge of about 1.6e-19 coulombs.',
+    'Violet and indigo sit at the short end of the visible spectrum.',
+    'The integral of one over x from 1 to e equals one.',
+    'Amethyst gemstones have a rich purple hue.',
+    'Newton''s second law states force equals mass times acceleration.',
+    'The jacaranda tree blooms with clusters of lilac flowers.',
+    'The square root of one hundred forty four is twelve.'
+  );
+  CRelatedIndices: array[0..4] of Integer = (0, 2, 4, 6, 8);
+  CSemanticQuery  = 'shades of purple and lavender';
+var
+  LEmb: TVdxEmbeddings;
+  LMemory: TVdxMemory;
+  LLoaded: Boolean;
+  LPath: string;
+  LI: Integer;
+  LHits: TArray<TVdxMemoryTurn>;
+  LCount: Integer;
+  LIsRelated: Boolean;
+  LRelatedFound: Integer;
+  LPass: Integer;
+  LFail: Integer;
+  LRaised: Boolean;
+
+  procedure Banner(const AText: string);
+  begin
+    TVdxUtils.PrintLn();
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '========================================================');
+    TVdxUtils.PrintLn(COLOR_YELLOW + '  %s', [AText]);
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '========================================================');
+  end;
+
+  procedure Check(const ACond: Boolean; const ALabel: string);
+  begin
+    if ACond then
+    begin
+      Inc(LPass);
+      TVdxUtils.PrintLn(COLOR_GREEN + '  [PASS] %s', [ALabel]);
+    end
+    else
+    begin
+      Inc(LFail);
+      TVdxUtils.PrintLn(COLOR_RED + '  [FAIL] %s', [ALabel]);
+    end;
+  end;
+
+  function IsRelatedIndex(const AIdx: Integer): Boolean;
+  var
+    LK: Integer;
+  begin
+    Result := False;
+    for LK := 0 to High(CRelatedIndices) do
+      if CRelatedIndices[LK] = AIdx then
+      begin
+        Result := True;
+        Exit;
+      end;
+  end;
+
+begin
+  LPass := 0;
+  LFail := 0;
+  LPath := TPath.Combine(ExtractFilePath(ParamStr(0)), CDbFile);
+
+  TVdxUtils.PrintLn(
+    'VECTOR SEARCH ROUNDTRIP - TVdxMemory.SearchVector end-to-end test');
+  TVdxUtils.PrintLn(COLOR_WHITE + 'Model:   %s', [CModelPath]);
+  TVdxUtils.PrintLn(COLOR_WHITE + 'DB path: %s', [LPath]);
+
+  // Fresh DB every run — drop any leftover from a prior aborted run.
+  if TFile.Exists(LPath) then
+    TFile.Delete(LPath);
+
+  LEmb := TVdxEmbeddings.Create();
+  try
+    LEmb.SetStatusCallback(StatusCallback, nil);
+
+    Banner('LOAD - open embedding GGUF and build GPU pipelines');
+    LLoaded := LEmb.LoadModel(CModelPath);
+    if not LLoaded then
+    begin
+      TVdxUtils.PrintLn(COLOR_RED + 'LoadModel failed - aborting.');
+      Exit;
+    end;
+
+    LMemory := TVdxMemory.Create();
+    try
+      // --- Phase A: open DB, attach, write, search ---
+      Banner('PHASE A - open fresh DB, attach embedder, write 10 turns');
+      if not LMemory.OpenSession(LPath) then
+      begin
+        TVdxUtils.PrintLn(COLOR_RED + 'OpenSession failed - aborting.');
+        Exit;
+      end;
+
+      LMemory.AttachEmbeddings(LEmb);
+
+      for LI := 0 to 9 do
+        LMemory.AppendTurn(CTurnRoles[LI], CTurnTexts[LI],
+          Length(CTurnTexts[LI]) div 4);
+
+      LCount := LMemory.GetTurnCount();
+      Check(LCount = 10,
+        Format('GetTurnCount() = 10 (got %d)', [LCount]));
+
+      Banner('PHASE A - semantic query, expect all 5 top-5 hits RELATED');
+      LHits := LMemory.SearchVector(CSemanticQuery, 5);
+      Check(Length(LHits) = 5,
+        Format('SearchVector returns 5 hits (got %d)', [Length(LHits)]));
+
+      // Count how many of the top 5 are from the related cluster, and
+      // print each rank with its cosine score for human sanity-check.
+      LRelatedFound := 0;
+      for LI := 0 to High(LHits) do
+      begin
+        LIsRelated := IsRelatedIndex(LHits[LI].TurnIndex);
+        if LIsRelated then
+          Inc(LRelatedFound);
+        if LIsRelated then
+          TVdxUtils.PrintLn(COLOR_CYAN +
+            '  rank %d: turn_index=%d cosine=%.4f  [RELATED]   %s',
+            [LI, LHits[LI].TurnIndex, LHits[LI].CosineScore,
+             LHits[LI].Text])
+        else
+          TVdxUtils.PrintLn(COLOR_CYAN +
+            '  rank %d: turn_index=%d cosine=%.4f  [UNRELATED] %s',
+            [LI, LHits[LI].TurnIndex, LHits[LI].CosineScore,
+             LHits[LI].Text]);
+      end;
+      Check(LRelatedFound = 5,
+        Format('All 5 top-5 hits are RELATED (got %d/5)', [LRelatedFound]));
+
+      // Monotonic non-increasing CosineScore across sorted results.
+      for LI := 1 to High(LHits) do
+        Check(LHits[LI - 1].CosineScore >= LHits[LI].CosineScore,
+          Format('Score sorted DESC at rank %d: %.4f >= %.4f',
+            [LI, LHits[LI - 1].CosineScore, LHits[LI].CosineScore]));
+
+      Banner('PHASE A - ATopK=0 returns empty');
+      LHits := LMemory.SearchVector('anything', 0);
+      Check(Length(LHits) = 0,
+        Format('ATopK=0 returns empty array (got %d)', [Length(LHits)]));
+
+      // --- Phase B: close, reopen, re-attach, re-search ---
+      Banner('PHASE B - close, reopen same DB, re-attach, search again');
+      LMemory.CloseSession();
+      Check(not LMemory.IsOpen(),
+        'IsOpen() = False after CloseSession()');
+
+      if not LMemory.OpenSession(LPath) then
+      begin
+        TVdxUtils.PrintLn(COLOR_RED + 'Reopen failed - aborting.');
+        Exit;
+      end;
+      Check(LMemory.IsOpen(),
+        'IsOpen() = True after reopen');
+
+      LCount := LMemory.GetTurnCount();
+      Check(LCount = 10,
+        Format('GetTurnCount() = 10 after reopen (got %d)', [LCount]));
+
+      LMemory.AttachEmbeddings(LEmb);
+
+      LHits := LMemory.SearchVector(CSemanticQuery, 5);
+      LRelatedFound := 0;
+      for LI := 0 to High(LHits) do
+        if IsRelatedIndex(LHits[LI].TurnIndex) then
+          Inc(LRelatedFound);
+      Check(LRelatedFound = 5,
+        Format('After reopen, all 5 top-5 hits still RELATED (got %d/5)',
+          [LRelatedFound]));
+
+      // --- Phase C: detach, assert SearchVector raises ---
+      Banner('PHASE C - detach embedder, SearchVector must raise');
+      LMemory.DetachEmbeddings();
+      LRaised := False;
+      try
+        LMemory.SearchVector('anything', 5);
+      except
+        on E: Exception do
+        begin
+          LRaised := True;
+          TVdxUtils.PrintLn(COLOR_CYAN + '  expected exception: %s',
+            [E.Message]);
+        end;
+      end;
+      Check(LRaised,
+        'SearchVector raises after DetachEmbeddings');
+
+    finally
+      LMemory.CloseSession();
+      LMemory.Free();
+    end;
+  finally
+    LEmb.UnloadModel();
+    LEmb.Free();
+  end;
+
+  // Cleanup — remove the DB file so the next run starts clean.
+  if TFile.Exists(LPath) then
+    TFile.Delete(LPath);
+
+  // --- Summary ---
+  Banner('RESULTS');
+  TVdxUtils.PrintLn(COLOR_GREEN + '  Passed: %d', [LPass]);
+  if LFail = 0 then
+    TVdxUtils.PrintLn(COLOR_GREEN + '  Failed: %d', [LFail])
+  else
+    TVdxUtils.PrintLn(COLOR_RED + '  Failed: %d', [LFail]);
+end;
+
+// ---------------------------------------------------------------------------
 // Test09_EmbeddingsRoundtrip — loads EmbeddingGemma, embeds three sentences
 // with semantic relationships, and asserts that the related pair scores
 // higher cosine similarity than either does against the unrelated sentence.
@@ -1502,7 +1741,7 @@ begin
   try
     TVdxUtils.Pause('Press any key to start inference...');
 
-    LIndex := 10;
+    LIndex := 8;
 
     case LIndex of
       1: Test01();
@@ -1512,6 +1751,7 @@ begin
       5: Test05();
       6: Test06_FTS5Probe();
       7: Test07_MemoryRoundtrip();
+      8: Test08_VectorSearchRoundtrip();
       9: Test09_EmbeddingsRoundtrip();
       10: Test10_RebuildThreshold();
     end;
