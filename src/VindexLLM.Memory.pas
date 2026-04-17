@@ -21,6 +21,7 @@ uses
   System.DateUtils,
   System.Generics.Collections,
   System.Generics.Defaults,
+  System.Hash,
   Data.DB,
   FireDAC.Stan.Intf,
   FireDAC.Stan.Option,
@@ -58,6 +59,7 @@ const
   CVdxMemRoleUser:      string = 'user';
   CVdxMemRoleAssistant: string = 'assistant';
   CVdxMemRoleSystem:    string = 'system';
+  CVdxMemRoleFact:      string = 'fact';
 
 type
 
@@ -78,6 +80,7 @@ type
     CreatedAt   : Int64;    // unix epoch seconds
     Score       : Single;   // BM25; only set by SearchFTS5  (lower = better)
     CosineScore : Single;   // cosine; only set by SearchVector (higher = better)
+    Pinned      : Boolean;  // true if turn is pinned (survives rebuild aging)
   end;
 
   { TVdxMemory — SQLite + FTS5-backed turn journal for one conversation
@@ -130,6 +133,14 @@ type
     // normalized vectors cosine equals the dot product.
     function  CosineDot(const AVecA, AVecB: TArray<Single>): Single;
 
+    // Text normalization for dedup hashing: lowercase, collapse all
+    // runs of whitespace to a single space, trim leading/trailing.
+    function  NormalizeText(const AText: string): string;
+
+    // SHA-256 of normalized text. Returns raw 32-byte digest suitable
+    // for BLOB storage and exact-match lookup.
+    function  ComputeContentHash(const AText: string): TBytes;
+
   public
     constructor Create(); override;
     destructor Destroy(); override;
@@ -175,6 +186,21 @@ type
     // silently.
     function  SearchVector(const AQuery: string;
       const ATopK: Integer): TArray<TVdxMemoryTurn>;
+
+    // Inject a fact not tied to a conversational turn. Uses role 'fact'.
+    // Participates in FTS5 and vector retrieval. Dedup applies.
+    function  AddFact(const AText: string;
+      const APinned: Boolean = True): Int64;
+
+    // Delete a single turn by id. FTS5 triggers cascade automatically.
+    procedure PurgeTurn(const ATurnId: Int64);
+
+    // Delete all turns. Resets turn index to 0. Schema stays intact.
+    procedure PurgeAll();
+
+    // Delete turns matching an arbitrary WHERE clause. Dangerous —
+    // intended for prototyping and maintenance only.
+    procedure PurgeWhere(const AWhereClause: string);
 
     // Utility
     function  GetDbPath(): string;
@@ -330,10 +356,15 @@ procedure TVdxMemory.MigrateSchema();
 var
   LQuery: TFDQuery;
   LHasEmbedding: Boolean;
+  LHasContentHash: Boolean;
+  LHasPinned: Boolean;
+  LColName: string;
 begin
   // Probe current columns via SQLite introspection. PRAGMA table_info
   // returns one row per column with the column name in the 'name' field.
   LHasEmbedding := False;
+  LHasContentHash := False;
+  LHasPinned := False;
   LQuery := TFDQuery.Create(nil);
   try
     LQuery.Connection := FConn;
@@ -341,11 +372,13 @@ begin
     LQuery.Open();
     while not LQuery.Eof do
     begin
-      if SameText(LQuery.FieldByName('name').AsString, 'embedding') then
-      begin
-        LHasEmbedding := True;
-        Break;
-      end;
+      LColName := LQuery.FieldByName('name').AsString;
+      if SameText(LColName, 'embedding') then
+        LHasEmbedding := True
+      else if SameText(LColName, 'content_hash') then
+        LHasContentHash := True
+      else if SameText(LColName, 'pinned') then
+        LHasPinned := True;
       LQuery.Next();
     end;
     LQuery.Close();
@@ -353,11 +386,15 @@ begin
     LQuery.Free();
   end;
 
-  // Add embedding column if missing. SQLite's ALTER TABLE ADD COLUMN
-  // is not idempotent (it errors if the column already exists), hence
-  // the introspection guard above. Default NULL for all existing rows.
+  // Add columns if missing. SQLite's ALTER TABLE ADD COLUMN is not
+  // idempotent (it errors if the column already exists), hence the
+  // introspection guards above.
   if not LHasEmbedding then
     FConn.ExecSQL('ALTER TABLE turns ADD COLUMN embedding BLOB');
+  if not LHasContentHash then
+    FConn.ExecSQL('ALTER TABLE turns ADD COLUMN content_hash BLOB');
+  if not LHasPinned then
+    FConn.ExecSQL('ALTER TABLE turns ADD COLUMN pinned INTEGER DEFAULT 0');
 end;
 
 procedure TVdxMemory.LoadNextTurnIndex();
@@ -455,6 +492,9 @@ var
   LVec: TArray<Single>;
   LBytes: TBytes;
   LStream: TBytesStream;
+  LHash: TBytes;
+  LHashStream: TBytesStream;
+  LDupQuery: TFDQuery;
 begin
   Result := 0;
   if not IsOpen() then
@@ -469,6 +509,34 @@ begin
       'TVdxMemory.AppendTurn: attached embedder is no longer loaded — ' +
       'call DetachEmbeddings before unloading the embedder');
 
+  // Exact-duplicate suppression: compute SHA-256 of normalized text and
+  // check if a row with the same hash already exists. If so, return the
+  // existing turn_id without inserting — this prevents the same content
+  // from being stored twice in one session.
+  LHash := ComputeContentHash(AText);
+  LDupQuery := TFDQuery.Create(nil);
+  try
+    LDupQuery.Connection := FConn;
+    LDupQuery.SQL.Text :=
+      'SELECT turn_id FROM turns WHERE content_hash = :h LIMIT 1';
+    LHashStream := TBytesStream.Create(LHash);
+    try
+      LDupQuery.ParamByName('h').LoadFromStream(LHashStream, ftBlob);
+    finally
+      LHashStream.Free();
+    end;
+    LDupQuery.Open();
+    if not LDupQuery.Eof then
+    begin
+      Result := LDupQuery.Fields[0].AsLargeInt;
+      LDupQuery.Close();
+      Exit;
+    end;
+    LDupQuery.Close();
+  finally
+    LDupQuery.Free();
+  end;
+
   // UTC unix seconds — matches schema contract documented in TASK-memory-v1.
   LNowUnix := DateTimeToUnix(Now(), False);
 
@@ -477,13 +545,25 @@ begin
     LQuery.Connection := FConn;
     LQuery.SQL.Text :=
       'INSERT INTO turns ' +
-      '  (turn_index, role, text, token_count, created_at, embedding) ' +
-      'VALUES (:idx, :role, :txt, :tok, :ts, :emb)';
+      '  (turn_index, role, text, token_count, created_at, embedding, ' +
+      '   content_hash, pinned) ' +
+      'VALUES (:idx, :role, :txt, :tok, :ts, :emb, :hash, :pin)';
     LQuery.ParamByName('idx').AsInteger := FNextTurnIndex;
     LQuery.ParamByName('role').AsString := ARole;
     LQuery.ParamByName('txt').AsString  := AText;
     LQuery.ParamByName('tok').AsInteger := ATokenCount;
     LQuery.ParamByName('ts').AsLargeInt := LNowUnix;
+
+    // Bind content hash (already computed during dedup check above).
+    LHashStream := TBytesStream.Create(LHash);
+    try
+      LQuery.ParamByName('hash').LoadFromStream(LHashStream, ftBlob);
+    finally
+      LHashStream.Free();
+    end;
+
+    // Default: not pinned. AddFact uses a separate path with pinned=1.
+    LQuery.ParamByName('pin').AsInteger := 0;
 
     if FEmbedder <> nil then
     begin
@@ -543,6 +623,7 @@ begin
   Result.CreatedAt   := AQuery.FieldByName('created_at').AsLargeInt;
   Result.Score       := 0.0;
   Result.CosineScore := 0.0;
+  Result.Pinned      := AQuery.FieldByName('pinned').AsInteger <> 0;
 end;
 
 function TVdxMemory.SingleArrayToBytes(
@@ -590,6 +671,59 @@ begin
   Result := LSum;
 end;
 
+function TVdxMemory.NormalizeText(const AText: string): string;
+var
+  LI: Integer;
+  LLen: Integer;
+  LCh: Char;
+  LInSpace: Boolean;
+  LBuf: TStringBuilder;
+begin
+  // Lowercase + collapse all whitespace runs to a single space + trim.
+  // Used to produce a canonical form for SHA-256 dedup hashing so that
+  // trivial formatting differences don't defeat exact-match detection.
+  LBuf := TStringBuilder.Create(Length(AText));
+  try
+    LInSpace := True; // true = suppress leading spaces
+    LLen := Length(AText);
+    for LI := 1 to LLen do
+    begin
+      LCh := AText[LI];
+      if (LCh = ' ') or (LCh = #9) or (LCh = #10) or (LCh = #13) then
+      begin
+        if not LInSpace then
+        begin
+          LBuf.Append(' ');
+          LInSpace := True;
+        end;
+      end
+      else
+      begin
+        LBuf.Append(LowerCase(LCh));
+        LInSpace := False;
+      end;
+    end;
+    Result := Trim(LBuf.ToString());
+  finally
+    LBuf.Free();
+  end;
+end;
+
+function TVdxMemory.ComputeContentHash(const AText: string): TBytes;
+var
+  LNorm: string;
+  LUtf8: TBytes;
+  LHash: THashSHA2;
+begin
+  // SHA-256 of the normalized text encoded as UTF-8. Returns raw
+  // 32-byte digest for BLOB storage and exact-match lookup.
+  LNorm := NormalizeText(AText);
+  LUtf8 := TEncoding.UTF8.GetBytes(LNorm);
+  LHash := THashSHA2.Create();
+  LHash.Update(LUtf8, Length(LUtf8));
+  Result := LHash.HashAsBytes;
+end;
+
 function TVdxMemory.GetTurn(const ATurnId: Int64): TVdxMemoryTurn;
 var
   LQuery: TFDQuery;
@@ -603,6 +737,7 @@ begin
   Result.CreatedAt   := 0;
   Result.Score       := 0.0;
   Result.CosineScore := 0.0;
+  Result.Pinned      := False;
 
   if not IsOpen() then
     raise Exception.Create('TVdxMemory.GetTurn: session not open');
@@ -611,7 +746,7 @@ begin
   try
     LQuery.Connection := FConn;
     LQuery.SQL.Text :=
-      'SELECT turn_id, turn_index, role, text, token_count, created_at ' +
+      'SELECT turn_id, turn_index, role, text, token_count, created_at, pinned ' +
       'FROM turns WHERE turn_id = :id';
     LQuery.ParamByName('id').AsLargeInt := ATurnId;
     LQuery.Open();
@@ -664,7 +799,7 @@ begin
     // so the caller receives chronological order across the window:
     // oldest -> newest within the returned slice.
     LQuery.SQL.Text :=
-      'SELECT turn_id, turn_index, role, text, token_count, created_at ' +
+      'SELECT turn_id, turn_index, role, text, token_count, created_at, pinned ' +
       'FROM turns ORDER BY turn_index DESC LIMIT :lim';
     LQuery.ParamByName('lim').AsInteger := ACount;
     LQuery.Open();
@@ -759,7 +894,7 @@ begin
     // ascending so the best matches come first in the result set.
     LQuery.SQL.Text :=
       'SELECT turns.turn_id, turns.turn_index, turns.role, turns.text, ' +
-      '       turns.token_count, turns.created_at, ' +
+      '       turns.token_count, turns.created_at, turns.pinned, ' +
       '       bm25(turns_fts) AS score ' +
       'FROM turns_fts ' +
       'JOIN turns ON turns.turn_id = turns_fts.rowid ' +
@@ -835,7 +970,7 @@ begin
     LQuery.Connection := FConn;
     LQuery.SQL.Text :=
       'SELECT turn_id, turn_index, role, text, token_count, created_at, ' +
-      '       embedding ' +
+      '       pinned, embedding ' +
       'FROM turns ' +
       'WHERE embedding IS NOT NULL';
     LQuery.Open();
@@ -900,6 +1035,157 @@ begin
     LQuery.Free();
     LList.Free();
   end;
+end;
+
+function TVdxMemory.AddFact(const AText: string;
+  const APinned: Boolean): Int64;
+var
+  LQuery: TFDQuery;
+  LNowUnix: Int64;
+  LVec: TArray<Single>;
+  LBytes: TBytes;
+  LStream: TBytesStream;
+  LHash: TBytes;
+  LHashStream: TBytesStream;
+  LDupQuery: TFDQuery;
+begin
+  Result := 0;
+  if not IsOpen() then
+    raise Exception.Create('TVdxMemory.AddFact: session not open');
+
+  // Same embedder guard as AppendTurn.
+  if (FEmbedder <> nil) and (not FEmbedder.IsLoaded()) then
+    raise Exception.Create(
+      'TVdxMemory.AddFact: attached embedder is no longer loaded — ' +
+      'call DetachEmbeddings before unloading the embedder');
+
+  // Dedup — identical to AppendTurn: skip if hash already exists.
+  LHash := ComputeContentHash(AText);
+  LDupQuery := TFDQuery.Create(nil);
+  try
+    LDupQuery.Connection := FConn;
+    LDupQuery.SQL.Text :=
+      'SELECT turn_id FROM turns WHERE content_hash = :h LIMIT 1';
+    LHashStream := TBytesStream.Create(LHash);
+    try
+      LDupQuery.ParamByName('h').LoadFromStream(LHashStream, ftBlob);
+    finally
+      LHashStream.Free();
+    end;
+    LDupQuery.Open();
+    if not LDupQuery.Eof then
+    begin
+      Result := LDupQuery.Fields[0].AsLargeInt;
+      LDupQuery.Close();
+      Exit;
+    end;
+    LDupQuery.Close();
+  finally
+    LDupQuery.Free();
+  end;
+
+  LNowUnix := DateTimeToUnix(Now(), False);
+
+  LQuery := TFDQuery.Create(nil);
+  try
+    LQuery.Connection := FConn;
+    LQuery.SQL.Text :=
+      'INSERT INTO turns ' +
+      '  (turn_index, role, text, token_count, created_at, embedding, ' +
+      '   content_hash, pinned) ' +
+      'VALUES (:idx, :role, :txt, :tok, :ts, :emb, :hash, :pin)';
+    LQuery.ParamByName('idx').AsInteger := FNextTurnIndex;
+    LQuery.ParamByName('role').AsString := CVdxMemRoleFact;
+    LQuery.ParamByName('txt').AsString  := AText;
+    LQuery.ParamByName('tok').AsInteger := 0; // facts have no token count
+    LQuery.ParamByName('ts').AsLargeInt := LNowUnix;
+
+    // Bind content hash.
+    LHashStream := TBytesStream.Create(LHash);
+    try
+      LQuery.ParamByName('hash').LoadFromStream(LHashStream, ftBlob);
+    finally
+      LHashStream.Free();
+    end;
+
+    // Pinned flag — facts default to pinned=True per the API contract.
+    if APinned then
+      LQuery.ParamByName('pin').AsInteger := 1
+    else
+      LQuery.ParamByName('pin').AsInteger := 0;
+
+    if FEmbedder <> nil then
+    begin
+      LVec := FEmbedder.Embed(AText, False);
+      LBytes := SingleArrayToBytes(LVec);
+      LStream := TBytesStream.Create(LBytes);
+      try
+        LQuery.ParamByName('emb').LoadFromStream(LStream, ftBlob);
+      finally
+        LStream.Free();
+      end;
+    end
+    else
+    begin
+      LQuery.ParamByName('emb').DataType := ftBlob;
+      LQuery.ParamByName('emb').Clear();
+    end;
+
+    LQuery.ExecSQL();
+
+    LQuery.SQL.Text := 'SELECT last_insert_rowid()';
+    LQuery.Open();
+    Result := LQuery.Fields[0].AsLargeInt;
+    LQuery.Close();
+
+    Inc(FNextTurnIndex);
+  finally
+    LQuery.Free();
+  end;
+end;
+
+procedure TVdxMemory.PurgeTurn(const ATurnId: Int64);
+var
+  LQuery: TFDQuery;
+begin
+  if not IsOpen() then
+    raise Exception.Create('TVdxMemory.PurgeTurn: session not open');
+
+  LQuery := TFDQuery.Create(nil);
+  try
+    LQuery.Connection := FConn;
+    LQuery.SQL.Text := 'DELETE FROM turns WHERE turn_id = :id';
+    LQuery.ParamByName('id').AsLargeInt := ATurnId;
+    LQuery.ExecSQL();
+  finally
+    LQuery.Free();
+  end;
+end;
+
+procedure TVdxMemory.PurgeAll();
+begin
+  if not IsOpen() then
+    raise Exception.Create('TVdxMemory.PurgeAll: session not open');
+
+  FConn.ExecSQL('DELETE FROM turns');
+  FNextTurnIndex := 0;
+end;
+
+procedure TVdxMemory.PurgeWhere(const AWhereClause: string);
+begin
+  if not IsOpen() then
+    raise Exception.Create('TVdxMemory.PurgeWhere: session not open');
+  if AWhereClause = '' then
+    raise Exception.Create(
+      'TVdxMemory.PurgeWhere: empty WHERE clause — use PurgeAll instead');
+
+  // WARNING: This executes a caller-supplied WHERE clause directly.
+  // Intended for prototyping and maintenance only. The caller is
+  // responsible for SQL correctness and safety.
+  FConn.ExecSQL('DELETE FROM turns WHERE ' + AWhereClause);
+
+  // Recalculate next turn index since we may have deleted the tail.
+  LoadNextTurnIndex();
 end;
 
 end.

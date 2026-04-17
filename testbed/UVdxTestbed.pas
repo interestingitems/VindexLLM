@@ -1729,6 +1729,221 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Test11_DedupPinPurge
+// Phase 2.5c verification: exact-duplicate suppression via content_hash,
+// pinned column, AddFact, PurgeTurn, PurgeAll, PurgeWhere. Loads the
+// embedder so AddFact can be verified in both SearchFTS5 and SearchVector.
+// ---------------------------------------------------------------------------
+procedure Test11_DedupPinPurge();
+const
+  CModelPath = 'C:\Dev\LLM\GGUF\embeddinggemma-300m-qat-Q8_0.gguf';
+  CDbFile    = 'test_dedup.db';
+
+  CTurnTexts: array[0..4] of string = (
+    'The capital of France is Paris.',
+    'Quantum entanglement links distant particles.',
+    'Chocolate cake is my favorite dessert.',
+    'The Nile is the longest river in Africa.',
+    'Rust is a systems programming language.'
+  );
+var
+  LEmb: TVdxEmbeddings;
+  LMemory: TVdxMemory;
+  LLoaded: Boolean;
+  LPath: string;
+  LI: Integer;
+  LIds: array[0..4] of Int64;
+  LReIds: array[0..4] of Int64;
+  LPass: Integer;
+  LFail: Integer;
+  LTurn: TVdxMemoryTurn;
+  LFactId: Int64;
+  LHits: TArray<TVdxMemoryTurn>;
+  LFactFound: Boolean;
+
+  procedure Banner(const AText: string);
+  begin
+    TVdxUtils.PrintLn();
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '========================================================');
+    TVdxUtils.PrintLn(COLOR_YELLOW + '  %s', [AText]);
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '========================================================');
+  end;
+
+  procedure Check(const ACond: Boolean; const ALabel: string);
+  begin
+    if ACond then
+    begin
+      Inc(LPass);
+      TVdxUtils.PrintLn(COLOR_GREEN + '  [PASS] %s', [ALabel]);
+    end
+    else
+    begin
+      Inc(LFail);
+      TVdxUtils.PrintLn(COLOR_RED + '  [FAIL] %s', [ALabel]);
+    end;
+  end;
+
+begin
+  LPass := 0;
+  LFail := 0;
+  LPath := TPath.Combine(ExtractFilePath(ParamStr(0)), CDbFile);
+
+  TVdxUtils.PrintLn('DEDUP / PIN / PURGE - Phase 2.5c test');
+  TVdxUtils.PrintLn(COLOR_WHITE + 'DB path: %s', [LPath]);
+
+  // Clean slate.
+  if TFile.Exists(LPath) then
+    TFile.Delete(LPath);
+
+  LEmb := TVdxEmbeddings.Create();
+  LMemory := TVdxMemory.Create();
+  try
+    // Load embedder for AddFact + SearchVector verification.
+    Banner('LOAD EMBEDDER');
+    LLoaded := LEmb.LoadModel(CModelPath);
+    Check(LLoaded, 'Embedder loaded');
+    if not LLoaded then
+    begin
+      TVdxUtils.PrintLn(COLOR_RED + 'Cannot load embedder - aborting.');
+      Exit;
+    end;
+
+    if not LMemory.OpenSession(LPath) then
+    begin
+      TVdxUtils.PrintLn(COLOR_RED + 'OpenSession failed - aborting.');
+      Exit;
+    end;
+    LMemory.AttachEmbeddings(LEmb);
+
+    // --- Phase A: Dedup ---
+    Banner('PHASE A - Dedup');
+
+    // Write 5 unique turns.
+    for LI := 0 to 4 do
+      LIds[LI] := LMemory.AppendTurn('user', CTurnTexts[LI],
+        Length(CTurnTexts[LI]) div 4);
+
+    Check(LMemory.GetTurnCount() = 5,
+      Format('Count = 5 after 5 unique inserts (got %d)',
+        [LMemory.GetTurnCount()]));
+
+    // Re-insert all 5 — should all be deduped.
+    for LI := 0 to 4 do
+      LReIds[LI] := LMemory.AppendTurn('user', CTurnTexts[LI],
+        Length(CTurnTexts[LI]) div 4);
+
+    Check(LMemory.GetTurnCount() = 5,
+      Format('Count still 5 after 5 duplicate inserts (got %d)',
+        [LMemory.GetTurnCount()]));
+
+    // Returned IDs must match originals.
+    for LI := 0 to 4 do
+      Check(LReIds[LI] = LIds[LI],
+        Format('Dedup ID match [%d]: original=%d, re-insert=%d',
+          [LI, LIds[LI], LReIds[LI]]));
+
+    // Dedup with trivial whitespace variation.
+    Check(LMemory.AppendTurn('user', '  The capital of   France  is Paris. ',
+      10) = LIds[0],
+      'Whitespace-normalized dedup matches turn 0');
+
+    Check(LMemory.GetTurnCount() = 5,
+      Format('Count still 5 after whitespace-variant insert (got %d)',
+        [LMemory.GetTurnCount()]));
+
+    // --- Phase B: PurgeTurn ---
+    Banner('PHASE B - PurgeTurn');
+
+    // Purge turn 2.
+    LMemory.PurgeTurn(LIds[2]);
+    Check(LMemory.GetTurnCount() = 4,
+      Format('Count = 4 after purging turn 2 (got %d)',
+        [LMemory.GetTurnCount()]));
+
+    // Verify turn 2 is gone.
+    LTurn := LMemory.GetTurn(LIds[2]);
+    Check(LTurn.TurnId = 0,
+      'GetTurn for purged turn 2 returns empty record');
+
+    // Verify turns 0 and 1 still present.
+    LTurn := LMemory.GetTurn(LIds[0]);
+    Check(LTurn.TurnId = LIds[0],
+      Format('Turn 0 still present (id=%d)', [LTurn.TurnId]));
+    LTurn := LMemory.GetTurn(LIds[1]);
+    Check(LTurn.TurnId = LIds[1],
+      Format('Turn 1 still present (id=%d)', [LTurn.TurnId]));
+
+    // --- Phase C: PurgeAll ---
+    Banner('PHASE C - PurgeAll');
+    LMemory.PurgeAll();
+    Check(LMemory.GetTurnCount() = 0,
+      Format('Count = 0 after PurgeAll (got %d)',
+        [LMemory.GetTurnCount()]));
+
+    // --- Phase D: AddFact ---
+    Banner('PHASE D - AddFact');
+    LFactId := LMemory.AddFact('The speed of light is 299792458 m/s.');
+    Check(LFactId > 0,
+      Format('AddFact returned valid id (%d)', [LFactId]));
+    Check(LMemory.GetTurnCount() = 1,
+      Format('Count = 1 after AddFact (got %d)',
+        [LMemory.GetTurnCount()]));
+
+    // Verify fact record.
+    LTurn := LMemory.GetTurn(LFactId);
+    Check(LTurn.Role = 'fact',
+      Format('Fact role = ''fact'' (got ''%s'')', [LTurn.Role]));
+    Check(LTurn.Pinned = True,
+      'Fact is pinned by default');
+
+    // Verify fact appears in FTS5.
+    LHits := LMemory.SearchFTS5('speed light', 5);
+    LFactFound := False;
+    for LI := 0 to High(LHits) do
+      if LHits[LI].TurnId = LFactId then
+        LFactFound := True;
+    Check(LFactFound,
+      'AddFact appears in SearchFTS5 results');
+
+    // Verify fact appears in SearchVector.
+    LHits := LMemory.SearchVector('speed of light meters per second', 5);
+    LFactFound := False;
+    for LI := 0 to High(LHits) do
+      if LHits[LI].TurnId = LFactId then
+        LFactFound := True;
+    Check(LFactFound,
+      'AddFact appears in SearchVector results');
+
+    // AddFact dedup — same text should return same id.
+    Check(LMemory.AddFact('The speed of light is 299792458 m/s.') = LFactId,
+      'AddFact dedup returns same id for identical text');
+    Check(LMemory.GetTurnCount() = 1,
+      Format('Count still 1 after duplicate AddFact (got %d)',
+        [LMemory.GetTurnCount()]));
+
+  finally
+    LMemory.DetachEmbeddings();
+    LMemory.CloseSession();
+    LMemory.Free();
+    LEmb.UnloadModel();
+    LEmb.Free();
+  end;
+
+  // Cleanup.
+  if TFile.Exists(LPath) then
+    TFile.Delete(LPath);
+
+  Banner('RESULTS');
+  TVdxUtils.PrintLn(COLOR_GREEN + '  Passed: %d', [LPass]);
+  if LFail = 0 then
+    TVdxUtils.PrintLn(COLOR_GREEN + '  Failed: %d', [LFail])
+  else
+    TVdxUtils.PrintLn(COLOR_RED + '  Failed: %d', [LFail]);
+end;
+
+// ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
 // Selects which test to run via LIndex, wraps in top-level exception handler,
 // and pauses for keypress when running from the Delphi IDE so you can read
@@ -1741,7 +1956,7 @@ begin
   try
     TVdxUtils.Pause('Press any key to start inference...');
 
-    LIndex := 8;
+    LIndex := 11;
 
     case LIndex of
       1: Test01();
@@ -1754,6 +1969,7 @@ begin
       8: Test08_VectorSearchRoundtrip();
       9: Test09_EmbeddingsRoundtrip();
       10: Test10_RebuildThreshold();
+      11: Test11_DedupPinPurge();
     end;
   except
     on E: Exception do
