@@ -1270,6 +1270,226 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Test10_RebuildThreshold — exercises the Phase 2.5a rebuild machinery in
+// TVdxInference. Loads the model with a small context cap (512) and a small
+// rebuild threshold (80 tokens), installs an anonymous-method rebuild
+// callback that records its arguments, drives Generate() calls until the
+// KV position crosses the threshold, then verifies that the next Generate()
+// invokes the callback exactly once with the expected arguments and resets
+// the cache to a position well below the pre-trigger value. A follow-up
+// Generate() (while still under threshold) must not re-fire the callback.
+//
+// The callback's returned replacement prompt supplants the user's prompt for
+// the triggering turn — this is the documented contract of SetRebuildCallback
+// and is how Phase B of the retrieval cycle will hand-craft the full
+// (system + retrieved + recent + new user) prefill in later subtasks.
+// ---------------------------------------------------------------------------
+procedure Test10_RebuildThreshold();
+const
+  CModelPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf';
+  CMaxCtx    = 512;
+  CRebuildAt = 80;
+  CMaxGen    = 64;
+  CReplacementPrompt =
+    'Hi. Please respond with the single word "ready".';
+  CPrompts: array[0..5] of string = (
+    'Describe a red apple in two sentences.',
+    'Describe a blue sky in two sentences.',
+    'Describe a green tree in two sentences.',
+    'Describe a yellow sun in two sentences.',
+    'Describe a white cloud in two sentences.',
+    'Describe a black cat in two sentences.'
+  );
+var
+  LInference: TVdxInference;
+  LConfig: TVdxSamplerConfig;
+  LLoaded: Boolean;
+  LPass: Integer;
+  LFail: Integer;
+  LFireCount: Integer;
+  LLastAPos: UInt32;
+  LLastAMax: UInt32;
+  LLastAPrompt: string;
+  LI: Integer;
+  LPosBefore: UInt32;
+  LPosAfter: UInt32;
+  LStageBPrompt: string;
+  LRebuildHandler: TVdxRebuildCallback;
+
+  procedure Banner(const AText: string);
+  begin
+    TVdxUtils.PrintLn();
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '========================================================');
+    TVdxUtils.PrintLn(COLOR_YELLOW + '  %s', [AText]);
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '========================================================');
+  end;
+
+  procedure Check(const ACond: Boolean; const ALabel: string);
+  begin
+    if ACond then
+    begin
+      Inc(LPass);
+      TVdxUtils.PrintLn(COLOR_GREEN + '  [PASS] %s', [ALabel]);
+    end
+    else
+    begin
+      Inc(LFail);
+      TVdxUtils.PrintLn(COLOR_RED + '  [FAIL] %s', [ALabel]);
+    end;
+  end;
+
+begin
+  LPass := 0;
+  LFail := 0;
+  LFireCount := 0;
+  LLastAPos := 0;
+  LLastAMax := 0;
+  LLastAPrompt := '';
+
+  TVdxUtils.PrintLn('REBUILD THRESHOLD - TVdxInference rebuild callback test');
+  TVdxUtils.PrintLn(COLOR_WHITE + 'MaxContext=%d RebuildAt=%d MaxGen=%d',
+    [CMaxCtx, CRebuildAt, CMaxGen]);
+
+  // Anonymous method closes over the counters above. Delphi captures locals
+  // by reference, so the callback sees and mutates the enclosing state
+  // directly. This keeps the test self-contained — no globals needed.
+  LRebuildHandler :=
+    function(const APosition: UInt32;
+             const AMaxContext: UInt32;
+             const APrompt: string;
+             const AUserData: Pointer): string
+    begin
+      Inc(LFireCount);
+      LLastAPos := APosition;
+      LLastAMax := AMaxContext;
+      LLastAPrompt := APrompt;
+      TVdxUtils.PrintLn(COLOR_MAGENTA +
+        '[rebuild callback] pos=%d max=%d prompt-len=%d',
+        [APosition, AMaxContext, Length(APrompt)]);
+      Result := CReplacementPrompt;
+    end;
+
+  GTokenWriter := TVdxConsoleTokenWriter.Create();
+  try
+    GTokenWriter.MaxWidth := 118;
+
+    LInference := TVdxInference.Create();
+    try
+      LInference.SetStatusCallback(StatusCallback, nil);
+      LInference.SetTokenCallback(PrintToken, nil);
+      LInference.SetInferenceEventCallback(InferenceEventCallback, nil);
+      LInference.SetCancelCallback(CancelCallback, nil);
+
+      Banner('LOAD - small context, small rebuild threshold');
+      LLoaded := LInference.LoadModel(CModelPath, CMaxCtx, CRebuildAt);
+      PrintErrors(LInference);
+      if not LLoaded then
+      begin
+        TVdxUtils.PrintLn(COLOR_RED + 'LoadModel failed - aborting.');
+        Exit;
+      end;
+      Check(LInference.GetRebuildAt() = CRebuildAt,
+        Format('GetRebuildAt() = %d (got %d)',
+          [CRebuildAt, LInference.GetRebuildAt()]));
+
+      // Deterministic sampling so turn sizes are reproducible across runs.
+      LConfig := TVdxSampler.DefaultConfig();
+      LConfig.Temperature := 0.0;
+      LConfig.TopK := 1;
+      LConfig.TopP := 1.0;
+      LConfig.MinP := 0.0;
+      LConfig.RepeatPenalty := 1.0;
+      LConfig.RepeatWindow := 64;
+      LConfig.Seed := 1;
+      LInference.SetSamplerConfig(LConfig);
+
+      LInference.SetRebuildCallback(LRebuildHandler, nil);
+
+      // --- Stage A: accumulate turns until position crosses threshold ---
+      Banner('STAGE A - accumulate turns, expect NO callback fires yet');
+      LI := 0;
+      while (LInference.GetKVCachePosition() < CRebuildAt) and
+            (LI < Length(CPrompts)) do
+      begin
+        TVdxUtils.PrintLn(COLOR_CYAN + '[turn %d] pos-before=%d',
+          [LI, LInference.GetKVCachePosition()]);
+        GTokenWriter.Reset();
+        LInference.Generate(CPrompts[LI], CMaxGen);
+        PrintErrors(LInference);
+        TVdxUtils.PrintLn(COLOR_CYAN + '[turn %d] pos-after =%d',
+          [LI, LInference.GetKVCachePosition()]);
+        Inc(LI);
+      end;
+
+      Check(LFireCount = 0,
+        Format('Callback NOT fired while below threshold (fire_count=%d)',
+          [LFireCount]));
+      Check(LInference.GetKVCachePosition() >= CRebuildAt,
+        Format('Position crossed threshold (%d >= %d)',
+          [LInference.GetKVCachePosition(), CRebuildAt]));
+
+      // --- Stage B: one more Generate(); callback should fire and reset ---
+      Banner('STAGE B - one more turn, callback fires and resets cache');
+      LPosBefore := LInference.GetKVCachePosition();
+      LStageBPrompt := CPrompts[LI mod Length(CPrompts)];
+      TVdxUtils.PrintLn(COLOR_CYAN + '[trigger] pos-before=%d prompt="%s"',
+        [LPosBefore, LStageBPrompt]);
+      GTokenWriter.Reset();
+      LInference.Generate(LStageBPrompt, CMaxGen);
+      PrintErrors(LInference);
+      LPosAfter := LInference.GetKVCachePosition();
+      TVdxUtils.PrintLn(COLOR_CYAN + '[trigger] pos-after =%d', [LPosAfter]);
+
+      Check(LFireCount = 1,
+        Format('Callback fired exactly once (fire_count=%d)', [LFireCount]));
+      Check(LLastAPos = LPosBefore,
+        Format('Callback APosition = pre-reset position (%d vs %d)',
+          [LLastAPos, LPosBefore]));
+      Check(LLastAMax = CMaxCtx,
+        Format('Callback AMaxContext = %d (got %d)',
+          [CMaxCtx, LLastAMax]));
+      Check(LLastAPrompt = LStageBPrompt,
+        'Callback APrompt matches Stage B user prompt');
+      // After the rebuild, position reflects only the replacement prompt's
+      // prefill + its generated tokens. It MUST be smaller than the
+      // pre-trigger position, otherwise the reset didn't happen.
+      Check(LPosAfter < LPosBefore,
+        Format('Position after rebuild < pre-trigger (%d < %d)',
+          [LPosAfter, LPosBefore]));
+
+      // --- Stage C: next turn stays under threshold, callback must not re-fire ---
+      Banner('STAGE C - next turn stays under threshold, callback quiet');
+      TVdxUtils.PrintLn(COLOR_CYAN + '[stage-c] pos-before=%d',
+        [LInference.GetKVCachePosition()]);
+      GTokenWriter.Reset();
+      LInference.Generate(CPrompts[(LI + 1) mod Length(CPrompts)], CMaxGen);
+      PrintErrors(LInference);
+      TVdxUtils.PrintLn(COLOR_CYAN + '[stage-c] pos-after =%d',
+        [LInference.GetKVCachePosition()]);
+      Check(LFireCount = 1,
+        Format('Callback still fired only once (fire_count=%d)',
+          [LFireCount]));
+
+    finally
+      LInference.UnloadModel();
+      LInference.Free();
+    end;
+  finally
+    GTokenWriter.Free();
+    GTokenWriter := nil;
+  end;
+
+  Banner('RESULTS');
+  TVdxUtils.PrintLn(COLOR_GREEN + '  Passed: %d', [LPass]);
+  if LFail = 0 then
+    TVdxUtils.PrintLn(COLOR_GREEN + '  Failed: %d', [LFail])
+  else
+    TVdxUtils.PrintLn(COLOR_RED + '  Failed: %d', [LFail]);
+end;
+
+// ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
 // Selects which test to run via LIndex, wraps in top-level exception handler,
 // and pauses for keypress when running from the Delphi IDE so you can read
@@ -1282,7 +1502,7 @@ begin
   try
     TVdxUtils.Pause('Press any key to start inference...');
 
-    LIndex := 1;
+    LIndex := 10;
 
     case LIndex of
       1: Test01();
@@ -1293,6 +1513,7 @@ begin
       6: Test06_FTS5Probe();
       7: Test07_MemoryRoundtrip();
       9: Test09_EmbeddingsRoundtrip();
+      10: Test10_RebuildThreshold();
     end;
   except
     on E: Exception do

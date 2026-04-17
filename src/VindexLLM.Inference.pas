@@ -124,6 +124,20 @@ type
   TVdxCancelCallback = reference to function(
     const AUserData: Pointer): Boolean;
 
+  { TVdxRebuildCallback — fires from Generate() when FCurrentPosition has
+    crossed the configured rebuild threshold. Receives current sequence
+    state and the pending user prompt so the handler (typically backed by
+    TVdxMemory retrieval) can construct a replacement prompt. Returning
+    a non-empty string triggers ResetKVCache() and substitutes the
+    returned text for the Generate() call's APrompt. Returning '' leaves
+    state untouched — the caller proceeds with the original prompt
+    against the existing cache. }
+  TVdxRebuildCallback = reference to function(
+    const APosition: UInt32;
+    const AMaxContext: UInt32;
+    const APrompt: string;
+    const AUserData: Pointer): string;
+
   { TVdxInference }
   TVdxInference = class(TVdxErrorsObject)
   private
@@ -144,6 +158,17 @@ type
 
     // Cancel callback
     FCancelCallback: TVdxCallback<TVdxCancelCallback>;
+
+    // Rebuild callback — fires from Generate() when FCurrentPosition has
+    // crossed FRebuildAt. Handler returns a replacement prompt (or ''
+    // to skip). Defaults to unassigned; inert until SetRebuildCallback.
+    FRebuildCallback: TVdxCallback<TVdxRebuildCallback>;
+
+    // Absolute token position at which Generate() will invoke the rebuild
+    // callback. Set by LoadModel: defaults to FMaxSeqLen * 3 / 4 when
+    // ARebuildAt is -1, or the caller's clamped value otherwise. Zero
+    // means "disabled" — the check short-circuits on (FRebuildAt > 0).
+    FRebuildAt: UInt32;
 
     // Model state
     FModelLoaded: Boolean;
@@ -294,7 +319,8 @@ type
     destructor Destroy(); override;
 
     function LoadModel(const AGGUFPath: string;
-      const AMaxContext: Integer = 2048): Boolean;
+      const AMaxContext: Integer = 2048;
+      const ARebuildAt: Integer = -1): Boolean;
 
     procedure SetTokenCallback(const ACallback: TVdxTokenCallback;
       const AUserData: Pointer);
@@ -305,6 +331,17 @@ type
 
     procedure SetCancelCallback(const ACallback: TVdxCancelCallback;
       const AUserData: Pointer);
+
+    // Install (or clear, by passing nil) the rebuild callback. When
+    // assigned, Generate() invokes it once per call if FCurrentPosition
+    // has reached FRebuildAt (and FRebuildAt > 0). The handler returns
+    // the replacement prompt; an empty result skips the rebuild.
+    procedure SetRebuildCallback(const ACallback: TVdxRebuildCallback;
+      const AUserData: Pointer);
+
+    // Current rebuild threshold in absolute token positions. Zero means
+    // disabled (no model loaded, or LoadModel has not been called).
+    function GetRebuildAt(): UInt32;
 
     function Generate(const APrompt: string;
       const AMaxTokens: Integer = 256): string;
@@ -379,6 +416,7 @@ begin
   FEmbedPtr := nil;
   FEmbedScale := 0.0;
   FCurrentPosition := 0;
+  FRebuildAt := 0;
 end;
 
 destructor TVdxInference.Destroy();
@@ -785,7 +823,8 @@ begin
 end;
 
 function TVdxInference.LoadModel(const AGGUFPath: string;
-  const AMaxContext: Integer): Boolean;
+  const AMaxContext: Integer;
+  const ARebuildAt: Integer): Boolean;
 var
   LLayer: Integer;
   LBufSize: UInt64;
@@ -863,6 +902,18 @@ begin
     LModelMax := 8192;
   FMaxSeqLen := Min(UInt32(AMaxContext), LModelMax);
   Status('Context length: %d (model max: %d)', [FMaxSeqLen, LModelMax]);
+
+  // Rebuild threshold: ARebuildAt = -1 (sentinel) selects the default of
+  // 75% of FMaxSeqLen, matching CVdxMemRebuildThreshold in VindexLLM.Memory.
+  // Any other non-positive value is treated as "use default" for safety.
+  // Positive values are clamped to FMaxSeqLen since a threshold above the
+  // context ceiling would never fire.
+  if ARebuildAt <= 0 then
+    FRebuildAt := (FMaxSeqLen * 3) div 4
+  else
+    FRebuildAt := Min(UInt32(ARebuildAt), FMaxSeqLen);
+  Status('Rebuild threshold: %d tokens (%.0f%% of %d)',
+    [FRebuildAt, (FRebuildAt * 100.0) / FMaxSeqLen, FMaxSeqLen]);
 
   // KV cache memory estimate
   LKVPerLayer := UInt64(2) * FMaxSeqLen * FNumKVHeads * FHeadDim * SizeOf(Single);
@@ -1262,6 +1313,19 @@ begin
   FCancelCallback.UserData := AUserData;
 end;
 
+procedure TVdxInference.SetRebuildCallback(
+  const ACallback: TVdxRebuildCallback;
+  const AUserData: Pointer);
+begin
+  FRebuildCallback.Callback := ACallback;
+  FRebuildCallback.UserData := AUserData;
+end;
+
+function TVdxInference.GetRebuildAt(): UInt32;
+begin
+  Result := FRebuildAt;
+end;
+
 procedure TVdxInference.SetSamplerConfig(const AConfig: TVdxSamplerConfig);
 begin
   FSampler.SetConfig(AConfig);
@@ -1623,6 +1687,8 @@ var
   LTotalWatch: TStopwatch;
   LPrefillWatch: TStopwatch;
   LGenWatch: TStopwatch;
+  LEffectivePrompt: string;
+  LReplacement: string;
 begin
   Result := '';
   FErrors.Clear();
@@ -1633,12 +1699,35 @@ begin
     Exit;
   end;
 
+  // Lazy rebuild: if the cache has crossed the configured threshold and a
+  // handler is installed, give it a chance to return a replacement prompt
+  // for this call. A non-empty result triggers ResetKVCache() and the
+  // rest of Generate() proceeds against a freshly zeroed cache, prefilling
+  // the replacement as the user-facing prompt for this turn. An empty
+  // result (or an absent handler, or FRebuildAt=0) leaves state untouched.
+  // The check fires at most once per Generate() invocation — the
+  // replacement is NOT re-checked against the threshold.
+  LEffectivePrompt := APrompt;
+  if FRebuildCallback.IsAssigned() and
+     (FRebuildAt > 0) and
+     (FCurrentPosition >= FRebuildAt) then
+  begin
+    LReplacement := FRebuildCallback.Callback(
+      FCurrentPosition, FMaxSeqLen, APrompt,
+      FRebuildCallback.UserData);
+    if LReplacement <> '' then
+    begin
+      ResetKVCache();
+      LEffectivePrompt := LReplacement;
+    end;
+  end;
+
   // Reset stats (preserve VRAM usage from LoadModel)
   FStats := Default(TVdxInferenceStats);
   FStats.VRAMUsage := FVRAMUsage;
 
   // Format prompt with chat template
-  LFormatted := TVdxChatTemplate.FormatPrompt(FArchitecture, APrompt);
+  LFormatted := TVdxChatTemplate.FormatPrompt(FArchitecture, LEffectivePrompt);
 
   // Tokenize. Only add BOS on fresh sessions — continuations must NOT
   // restart the token stream, otherwise the model sees a spurious begin-of-
