@@ -378,9 +378,6 @@ var
   LResponse: string;
   LContext: string;
   LRetrieved: TArray<TVdxMemoryTurn>;
-  LFiltered: TArray<TVdxMemoryTurn>;
-  LFilterCount: Integer;
-  LI: Integer;
 begin
   Result := '';
 
@@ -399,23 +396,8 @@ begin
   begin
     LRetrieved := RetrieveContext(AUserMessage, FRetrievalConfig.TopK);
 
-    // Filter to document roles only (chunk, fact). Conversation turns
-    // are already in the KV cache — including them here would duplicate.
-    LFilterCount := 0;
-    SetLength(LFiltered, Length(LRetrieved));
-    for LI := 0 to High(LRetrieved) do
-    begin
-      if (LRetrieved[LI].Role = CVdxMemRoleChunk) or
-         (LRetrieved[LI].Role = CVdxMemRoleFact) then
-      begin
-        LFiltered[LFilterCount] := LRetrieved[LI];
-        Inc(LFilterCount);
-      end;
-    end;
-    SetLength(LFiltered, LFilterCount);
-
-    if LFilterCount > 0 then
-      LContext := FormatRetrievedContext(LFiltered);
+    if Length(LRetrieved) > 0 then
+      LContext := FormatRetrievedContext(LRetrieved);
   end;
 
   // 4. Assemble prompt (system + context + user)
@@ -570,7 +552,6 @@ function TVdxSession.HandleRebuild(const APosition: UInt32;
   const AMaxContext: UInt32; const APrompt: string): string;
 var
   LRetrieved: TArray<TVdxMemoryTurn>;
-  LRecent: TArray<TVdxMemoryTurn>;
   LResult: string;
   LI: Integer;
 begin
@@ -578,14 +559,11 @@ begin
   if not IsLoaded() then
     Exit;
 
-  // --- 1. Retrieve relevant context (all roles — rebuild is full reconstruction) ---
+  // --- 1. Retrieve relevant context via RAG ---
   LRetrieved := RetrieveContext(FLastUserMessage, CVdxSessionMergeTopK);
 
-  // --- 2. Get recent turns (includes current user message) ---
-  LRecent := FMemory.GetRecentTurns(CVdxSessionRecentTurns);
-
-  // --- 3. Assemble replacement prompt ---
-  // First user turn: system prompt + retrieved context summary
+  // --- 2. Assemble lean replacement prompt ---
+  // Single user turn: system prompt + retrieved context + current question
   LResult := '<start_of_turn>user' + #10;
 
   if FSystemPrompt <> '' then
@@ -593,40 +571,16 @@ begin
 
   if Length(LRetrieved) > 0 then
   begin
-    LResult := LResult + 'Earlier conversation context:' + #10;
+    LResult := LResult + 'Reference information:' + #10;
     for LI := 0 to High(LRetrieved) do
-      LResult := LResult + LRetrieved[LI].Role + ': ' +
-        LRetrieved[LI].Text + #10;
+      LResult := LResult + '- ' + LRetrieved[LI].Text + #10;
     LResult := LResult + #10;
   end;
 
+  LResult := LResult + FLastUserMessage;
   LResult := LResult + '<end_of_turn>' + #10;
 
-  // Synthetic model acknowledgment (keeps template well-formed)
-  LResult := LResult + '<start_of_turn>model' + #10 +
-    'Understood.' + '<end_of_turn>' + #10;
-
-  // Recent turns as proper multi-turn exchanges
-  for LI := 0 to High(LRecent) do
-  begin
-    if LRecent[LI].Role = CVdxMemRoleUser then
-      LResult := LResult + '<start_of_turn>user' + #10 +
-        LRecent[LI].Text + '<end_of_turn>' + #10
-    else if LRecent[LI].Role = CVdxMemRoleAssistant then
-      LResult := LResult + '<start_of_turn>model' + #10 +
-        LRecent[LI].Text + '<end_of_turn>' + #10;
-  end;
-
-  // If the last recent turn is not a user turn (edge case), add
-  // the current user message explicitly so the model has a prompt.
-  if (Length(LRecent) = 0) or
-     (LRecent[High(LRecent)].Role <> CVdxMemRoleUser) then
-  begin
-    LResult := LResult + '<start_of_turn>user' + #10 +
-      FLastUserMessage + '<end_of_turn>' + #10;
-  end;
-
-  // Open the model turn for generation
+  // Open model turn for generation
   LResult := LResult + '<start_of_turn>model' + #10;
 
   Result := LResult;

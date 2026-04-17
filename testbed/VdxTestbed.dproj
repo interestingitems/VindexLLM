@@ -112,9 +112,11 @@
         <DCCReference Include="UVdxTestbed.pas"/>
         <DCCReference Include="UCommon.pas"/>
         <DCCReference Include="..\src\VindexLLM.Attention.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Chat.pas"/>
         <DCCReference Include="..\src\VindexLLM.ChatTemplate.pas"/>
         <DCCReference Include="..\src\VindexLLM.Compute.pas"/>
         <DCCReference Include="..\src\VindexLLM.Config.pas"/>
+        <DCCReference Include="..\src\VindexLLM.ConsoleChat.pas"/>
         <DCCReference Include="..\src\VindexLLM.Embeddings.pas"/>
         <DCCReference Include="..\src\VindexLLM.FFNWeights.pas"/>
         <DCCReference Include="..\src\VindexLLM.GGUFReader.pas"/>

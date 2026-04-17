@@ -43,7 +43,9 @@ uses
   VindexLLM.TokenWriter,
   VindexLLM.Memory,
   VindexLLM.Embeddings,
-  VindexLLM.Session;
+  VindexLLM.Session,
+  VindexLLM.Chat,
+  VindexLLM.ConsoleChat;
 
 var
   GTokenWriter: TVdxConsoleTokenWriter;
@@ -2266,6 +2268,40 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// ChatSession — interactive console chat using TVdxConsoleChat.
+// ---------------------------------------------------------------------------
+procedure ChatSession();
+const
+  CModelPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-null-space-abliterated.Q8_0.gguf';
+  CEmbedderPath = 'C:\Dev\LLM\GGUF\embeddinggemma-300m-qat-Q8_0.gguf';
+  CMemoryDb = 'session.db';
+  CMaxTokens = 1024;
+var
+  LChat: TVdxConsoleChat;
+  LConfig: TVdxSamplerConfig;
+begin
+  LChat := TVdxConsoleChat.Create();
+  try
+    LChat.ModelPath := CModelPath;
+    LChat.EmbedderPath := CEmbedderPath;
+    LChat.MemoryDbPath := CMemoryDb;
+    LChat.SystemPrompt := 'You are a helpful assistant.';
+    LChat.MaxTokens := CMaxTokens;
+
+    LConfig := TVdxSampler.DefaultConfig();
+    LConfig.Temperature := 1.0;
+    LConfig.TopK := 64;
+    LConfig.TopP := 0.95;
+    LConfig.Seed := 0;
+    LChat.SamplerConfig := LConfig;
+
+    LChat.Run();
+  finally
+    LChat.Free();
+  end;
+end;
+
+// ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
 // Selects which test to run via LIndex, wraps in top-level exception handler,
 // and pauses for keypress when running from the Delphi IDE so you can read
@@ -2278,7 +2314,7 @@ begin
   try
     TVdxUtils.Pause('Press any key to start inference...');
 
-    LIndex := 13;
+    LIndex := 14;
 
     case LIndex of
       1: Test01();
@@ -2294,6 +2330,7 @@ begin
       11: Test11_DedupPinPurge();
       12: Test12_DocumentIngest();
       13: Test13_SessionChat();
+      14: ChatSession();
     end;
   except
     on E: Exception do
