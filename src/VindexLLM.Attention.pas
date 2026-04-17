@@ -241,11 +241,13 @@ type
     FRoPEBatchShader: VkShaderModule;
     FKVStoreBatchShader: VkShaderModule;
     FScoresPrefillShader: VkShaderModule;
+    FScoresPrefillBidirShader: VkShaderModule;
     FSoftmaxPrefillShader: VkShaderModule;
     FValuePrefillShader: VkShaderModule;
     FRoPEBatchBundle: TVdxComputePipelineBundle;
     FKVStoreBatchBundle: TVdxComputePipelineBundle;
     FScoresPrefillBundle: TVdxComputePipelineBundle;
+    FScoresPrefillBidirBundle: TVdxComputePipelineBundle;
     FSoftmaxPrefillBundle: TVdxComputePipelineBundle;
     FValuePrefillBundle: TVdxComputePipelineBundle;
 
@@ -367,6 +369,10 @@ type
     // AStartPos: absolute KV slot at which to begin writing this batch.
     //   For a fresh prefill, pass 0. For continuation after a loaded KV
     //   cache, pass the saved position.
+    // ABidirectional: when True, the attention-scores step skips the causal
+    //   mask so every query token sees every key in [0, seq_len). Required
+    //   for encoder-style models like EmbeddingGemma. Defaults False to
+    //   preserve the gemma3 decoder path exactly.
     // Must be called inside an active batch (BeginBatch/EndBatch).
     procedure ForwardBatch(const AInputMat: TVdxGpuBuffer;
       const AWeights: TVdxAttnLayerWeights;
@@ -379,7 +385,8 @@ type
       const AQMat: TVdxGpuBuffer;
       const AKMat: TVdxGpuBuffer;
       const AVMat: TVdxGpuBuffer;
-      const AAttnOutMat: TVdxGpuBuffer);
+      const AAttnOutMat: TVdxGpuBuffer;
+      const ABidirectional: Boolean = False);
 
     // Diagnostic read-only access to internal buffers (for debugging tests)
     property ScoresBuf: TVdxGpuBuffer read FScoresBuf;
@@ -460,11 +467,13 @@ begin
   FRoPEBatchShader := VK_NULL_HANDLE;
   FKVStoreBatchShader := VK_NULL_HANDLE;
   FScoresPrefillShader := VK_NULL_HANDLE;
+  FScoresPrefillBidirShader := VK_NULL_HANDLE;
   FSoftmaxPrefillShader := VK_NULL_HANDLE;
   FValuePrefillShader := VK_NULL_HANDLE;
   FRoPEBatchBundle.Pipeline := VK_NULL_HANDLE;
   FKVStoreBatchBundle.Pipeline := VK_NULL_HANDLE;
   FScoresPrefillBundle.Pipeline := VK_NULL_HANDLE;
+  FScoresPrefillBidirBundle.Pipeline := VK_NULL_HANDLE;
   FSoftmaxPrefillBundle.Pipeline := VK_NULL_HANDLE;
   FValuePrefillBundle.Pipeline := VK_NULL_HANDLE;
   FPrefillDescPool := VK_NULL_HANDLE;
@@ -681,6 +690,7 @@ begin
   FRoPEBatchShader := LoadShader('ROPE_BATCH');
   FKVStoreBatchShader := LoadShader('KV_CACHE_STORE_BATCH');
   FScoresPrefillShader := LoadShader('ATTN_SCORES_PREFILL');
+  FScoresPrefillBidirShader := LoadShader('ATTN_SCORES_PREFILL_BIDIR');
   FSoftmaxPrefillShader := LoadShader('SOFTMAX_PREFILL');
   FValuePrefillShader := LoadShader('ATTN_VALUE_PREFILL');
 
@@ -693,6 +703,12 @@ begin
     SizeOf(TVdxKVCacheStoreBatchPush));
   FScoresPrefillBundle := FCompute.CreateComputePipelineWithPush(
     FScoresPrefillShader, 'main', FAttnScoresDescLayout,
+    SizeOf(TVdxAttnScoresPrefillPush));
+  // Bidirectional variant uses identical bindings and push struct — it's
+  // the same shader with the causal mask block removed, so both pipelines
+  // are dispatch-compatible.
+  FScoresPrefillBidirBundle := FCompute.CreateComputePipelineWithPush(
+    FScoresPrefillBidirShader, 'main', FAttnScoresDescLayout,
     SizeOf(TVdxAttnScoresPrefillPush));
   FSoftmaxPrefillBundle := FCompute.CreateComputePipelineWithPush(
     FSoftmaxPrefillShader, 'main', FSoftmaxDescLayout,
@@ -826,11 +842,13 @@ begin
   FCompute.DestroyComputePipelineBundle(FRoPEBatchBundle);
   FCompute.DestroyComputePipelineBundle(FKVStoreBatchBundle);
   FCompute.DestroyComputePipelineBundle(FScoresPrefillBundle);
+  FCompute.DestroyComputePipelineBundle(FScoresPrefillBidirBundle);
   FCompute.DestroyComputePipelineBundle(FSoftmaxPrefillBundle);
   FCompute.DestroyComputePipelineBundle(FValuePrefillBundle);
   FCompute.DestroyShaderModuleHandle(FRoPEBatchShader);
   FCompute.DestroyShaderModuleHandle(FKVStoreBatchShader);
   FCompute.DestroyShaderModuleHandle(FScoresPrefillShader);
+  FCompute.DestroyShaderModuleHandle(FScoresPrefillBidirShader);
   FCompute.DestroyShaderModuleHandle(FSoftmaxPrefillShader);
   FCompute.DestroyShaderModuleHandle(FValuePrefillShader);
 
@@ -1004,7 +1022,8 @@ procedure TVdxAttention.ForwardBatch(const AInputMat: TVdxGpuBuffer;
   const AQMat: TVdxGpuBuffer;
   const AKMat: TVdxGpuBuffer;
   const AVMat: TVdxGpuBuffer;
-  const AAttnOutMat: TVdxGpuBuffer);
+  const AAttnOutMat: TVdxGpuBuffer;
+  const ABidirectional: Boolean = False);
 var
   LSeqLen: UInt32;
   LQKNormPush: TVdxQKNormPush;
@@ -1014,6 +1033,7 @@ var
   LScoresPush: TVdxAttnScoresPrefillPush;
   LSoftmaxPush: TVdxSoftmaxPrefillPush;
   LValuePush: TVdxAttnValuePrefillPush;
+  LScoresBundle: TVdxComputePipelineBundle;
 begin
   // Total keys in the filled cache after this batch writes its tokens.
   // Prefill dispatches and shader indexing must cover this range, not
@@ -1136,9 +1156,16 @@ begin
 
   // ---- Step 5: Prefill attention (scores + softmax + value) ----
 
-  // 5a. Causal attention scores: 3D dispatch (keys, heads, queries)
+  // 5a. Attention scores: 3D dispatch (keys, heads, queries).
   //   X dimension must cover SeqLen keys, not NumTokens — every new query
   //   token attends over the full filled cache (start_pos + num_tokens).
+  //   The shader chosen here determines whether the causal mask is applied:
+  //   default (causal) for decoder-only models, bidirectional for encoders.
+  if ABidirectional then
+    LScoresBundle := FScoresPrefillBidirBundle
+  else
+    LScoresBundle := FScoresPrefillBundle;
+
   LScoresPush.HeadDim := FHeadDim;
   LScoresPush.NumTokens := ANumTokens;
   LScoresPush.MaxSeq := FMaxSeqLen;
@@ -1150,7 +1177,7 @@ begin
   FCompute.UpdateDescriptorSetBuffers(FPrefillScoresDescSet,
     [AQMat, FKDecodeF32, FPrefillScoresBuf]);
   FCompute.DispatchComputeWithPush(
-    FScoresPrefillBundle.Pipeline, FScoresPrefillBundle.PipelineLayout,
+    LScoresBundle.Pipeline, LScoresBundle.PipelineLayout,
     FPrefillScoresDescSet, @LScoresPush, SizeOf(LScoresPush),
     (LSeqLen + 255) div 256, FNumQHeads, ANumTokens);
   FCompute.BatchBarrier(); // Scores ready for softmax

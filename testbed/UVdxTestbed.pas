@@ -23,13 +23,26 @@ uses
   System.IOUtils,
   System.Math,
   System.Generics.Collections,
+  FireDAC.Stan.Intf,
+  FireDAC.Stan.Option,
+  FireDAC.Stan.Error,
+  FireDAC.Stan.Def,
+  FireDAC.Stan.Async,
+  FireDAC.DApt,
+  FireDAC.Phys,
+  FireDAC.Phys.SQLite,
+  FireDAC.Phys.SQLiteWrapper,
+  FireDAC.Phys.SQLiteWrapper.Stat,
+  FireDAC.Comp.Client,
   VindexLLM.Utils,
   VindexLLM.Vulkan,
   VindexLLM.Compute,
   VindexLLM.TurboQuant,
   VindexLLM.Inference,
   VindexLLM.Sampler,
-  VindexLLM.TokenWriter;
+  VindexLLM.TokenWriter,
+  VindexLLM.Memory,
+  VindexLLM.Embeddings;
 
 var
   GTokenWriter: TVdxConsoleTokenWriter;
@@ -877,6 +890,386 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Test06_FTS5Probe — check whether FireDAC's statically-linked SQLite has the
+// FTS5 full-text-search module compiled in. Opens an in-memory database, asks
+// SQLite to report its version + compile flags, then tries to actually create
+// an FTS5 virtual table (the definitive test — compile flag is informational).
+// Also dumps PRAGMA compile_options so we know everything else that's in.
+// ---------------------------------------------------------------------------
+procedure Test06_FTS5Probe();
+var
+  LLink: TFDPhysSQLiteDriverLink;
+  LConn: TFDConnection;
+  LQuery: TFDQuery;
+  LFlagValue: Integer;
+  LCreateOK: Boolean;
+  LErrMsg: string;
+begin
+  TVdxUtils.PrintLn('FTS5 PROBE - FireDAC static SQLite capability check');
+
+  LLink := TFDPhysSQLiteDriverLink.Create(nil);
+  LConn := TFDConnection.Create(nil);
+  LQuery := TFDQuery.Create(nil);
+  try
+    LLink.EngineLinkage := slStatic;
+
+    LConn.DriverName := 'SQLite';
+    LConn.Params.Values['Database'] := ':memory:';
+    LConn.LoginPrompt := False;
+    LConn.Open();
+
+    LQuery.Connection := LConn;
+
+    // 1. SQLite version
+    LQuery.SQL.Text := 'SELECT sqlite_version()';
+    LQuery.Open();
+    TVdxUtils.PrintLn(COLOR_WHITE + 'SQLite version: %s',
+      [LQuery.Fields[0].AsString]);
+    LQuery.Close();
+
+    // 2. Compile flag (informational)
+    LQuery.SQL.Text := 'SELECT sqlite_compileoption_used(''ENABLE_FTS5'')';
+    LQuery.Open();
+    LFlagValue := LQuery.Fields[0].AsInteger;
+    TVdxUtils.PrintLn(COLOR_WHITE + 'ENABLE_FTS5 compile flag: %d',
+      [LFlagValue]);
+    LQuery.Close();
+
+    // 3. Real test — try to create an FTS5 virtual table
+    LCreateOK := False;
+    LErrMsg := '';
+    try
+      LConn.ExecSQL('CREATE VIRTUAL TABLE probe_fts USING fts5(content)');
+      LCreateOK := True;
+    except
+      on E: Exception do
+        LErrMsg := E.Message;
+    end;
+
+    TVdxUtils.PrintLn('');
+    if LCreateOK then
+      TVdxUtils.PrintLn(COLOR_GREEN +
+        'FTS5 AVAILABLE - CREATE VIRTUAL TABLE succeeded.')
+    else
+      TVdxUtils.PrintLn(COLOR_RED +
+        'FTS5 NOT AVAILABLE - Error: %s', [LErrMsg]);
+
+    // 4. Dump full compile options so we see everything else
+    TVdxUtils.PrintLn('');
+    TVdxUtils.PrintLn(COLOR_CYAN + '--- PRAGMA compile_options ---');
+    LQuery.SQL.Text := 'PRAGMA compile_options';
+    LQuery.Open();
+    while not LQuery.Eof do
+    begin
+      TVdxUtils.PrintLn('  %s', [LQuery.Fields[0].AsString]);
+      LQuery.Next();
+    end;
+    LQuery.Close();
+
+    LConn.Close();
+  finally
+    LQuery.Free();
+    LConn.Free();
+    LLink.Free();
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// Test07_MemoryRoundtrip — end-to-end exercise of TVdxMemory. Writes ten
+// alternating user/assistant turns to a fresh SQLite DB, asserts basic reads
+// (count, meta, FTS5 search, recent-turns ordering), closes the session,
+// re-opens the same file, and re-asserts everything to prove persistence
+// across sessions. Deletes the DB file on the way in and on the way out so
+// consecutive runs start from a known-clean state.
+// ---------------------------------------------------------------------------
+procedure Test07_MemoryRoundtrip();
+const
+  CDbFile = 'test_memory.db';
+  CTurnRoles: array[0..9] of string = (
+    'user', 'assistant', 'user', 'assistant', 'user',
+    'assistant', 'user', 'assistant', 'user', 'assistant'
+  );
+  // Turn 2 carries the ''purple'' marker, turn 5 carries ''Paris''.
+  // Remaining turns are neutral filler so the search ranks unambiguously.
+  CTurnTexts: array[0..9] of string = (
+    'Hello there, nice to meet you.',
+    'Hi! Great to meet you too. How can I help?',
+    'My favorite color is purple and I think about it often.',
+    'That is a lovely preference to have.',
+    'What is the capital city of France?',
+    'The capital of France is Paris, located in the north.',
+    'Interesting, thanks for that bit of trivia.',
+    'You are very welcome anytime.',
+    'What is 2 plus 2?',
+    'The answer is 4.'
+  );
+var
+  LMemory: TVdxMemory;
+  LPass: Integer;
+  LFail: Integer;
+  LPath: string;
+  LI: Integer;
+  LHits: TArray<TVdxMemoryTurn>;
+  LRecent: TArray<TVdxMemoryTurn>;
+  LCount: Integer;
+
+  procedure Banner(const AText: string);
+  begin
+    TVdxUtils.PrintLn();
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '========================================================');
+    TVdxUtils.PrintLn(COLOR_YELLOW + '  %s', [AText]);
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '========================================================');
+  end;
+
+  procedure Check(const ACond: Boolean; const ALabel: string);
+  begin
+    if ACond then
+    begin
+      Inc(LPass);
+      TVdxUtils.PrintLn(COLOR_GREEN + '  [PASS] %s', [ALabel]);
+    end
+    else
+    begin
+      Inc(LFail);
+      TVdxUtils.PrintLn(COLOR_RED + '  [FAIL] %s', [ALabel]);
+    end;
+  end;
+
+  procedure RunAssertions(const APhase: string);
+  var
+    LCI: Integer;
+  begin
+    Banner(Format('Assertions - %s', [APhase]));
+
+    LCount := LMemory.GetTurnCount();
+    Check(LCount = 10,
+      Format('GetTurnCount() = 10 (got %d)', [LCount]));
+
+    LHits := LMemory.SearchFTS5('purple', 3);
+    Check(Length(LHits) > 0,
+      Format('SearchFTS5(''purple'') returns >=1 hit (got %d)',
+        [Length(LHits)]));
+    if Length(LHits) > 0 then
+      Check(Pos('purple', LowerCase(LHits[0].Text)) > 0,
+        Format('Top ''purple'' hit contains ''purple'' (turn_index=%d)',
+          [LHits[0].TurnIndex]));
+
+    LHits := LMemory.SearchFTS5('Paris', 3);
+    Check(Length(LHits) > 0,
+      Format('SearchFTS5(''Paris'') returns >=1 hit (got %d)',
+        [Length(LHits)]));
+    if Length(LHits) > 0 then
+      Check(Pos('paris', LowerCase(LHits[0].Text)) > 0,
+        Format('Top ''Paris'' hit contains ''Paris'' (turn_index=%d)',
+          [LHits[0].TurnIndex]));
+
+    LRecent := LMemory.GetRecentTurns(3);
+    Check(Length(LRecent) = 3,
+      Format('GetRecentTurns(3) returns 3 items (got %d)',
+        [Length(LRecent)]));
+    if Length(LRecent) = 3 then
+    begin
+      for LCI := 0 to 2 do
+        Check(LRecent[LCI].TurnIndex = 7 + LCI,
+          Format('Recent[%d].TurnIndex = %d (got %d)',
+            [LCI, 7 + LCI, LRecent[LCI].TurnIndex]));
+    end;
+  end;
+
+begin
+  LPass := 0;
+  LFail := 0;
+  LPath := TPath.Combine(ExtractFilePath(ParamStr(0)), CDbFile);
+
+  TVdxUtils.PrintLn('MEMORY ROUNDTRIP - TVdxMemory end-to-end test');
+  TVdxUtils.PrintLn(COLOR_WHITE + 'DB path: %s', [LPath]);
+
+  // Fresh DB every run — drop any leftover from a prior aborted run.
+  if TFile.Exists(LPath) then
+    TFile.Delete(LPath);
+
+  LMemory := TVdxMemory.Create();
+  try
+    // --- Phase A: open a fresh DB, populate, assert ---
+    Banner('PHASE A - open fresh DB, write 10 turns');
+    if not LMemory.OpenSession(LPath) then
+    begin
+      TVdxUtils.PrintLn(COLOR_RED + 'OpenSession failed - aborting.');
+      Exit;
+    end;
+
+    LMemory.SetMeta('model_path', 'fake/model.gguf');
+    LMemory.SetMeta('max_context', '4096');
+
+    for LI := 0 to 9 do
+      LMemory.AppendTurn(CTurnRoles[LI], CTurnTexts[LI],
+        Length(CTurnTexts[LI]) div 4);
+
+    Check(LMemory.GetMeta('model_path') = 'fake/model.gguf',
+      'GetMeta(''model_path'') roundtrips');
+    Check(LMemory.GetMeta('missing') = '',
+      'GetMeta(''missing'') returns empty string');
+
+    RunAssertions('fresh session');
+
+    // --- Phase B: close, reopen, re-assert ---
+    Banner('PHASE B - close session');
+    LMemory.CloseSession();
+    Check(not LMemory.IsOpen(),
+      'IsOpen() = False after CloseSession()');
+
+    Banner('PHASE B - reopen same DB file');
+    if not LMemory.OpenSession(LPath) then
+    begin
+      TVdxUtils.PrintLn(COLOR_RED + 'Reopen failed - aborting.');
+      Exit;
+    end;
+    Check(LMemory.IsOpen(),
+      'IsOpen() = True after reopen');
+    Check(LMemory.GetMeta('model_path') = 'fake/model.gguf',
+      'session_meta survives reopen');
+
+    RunAssertions('reopened session');
+
+  finally
+    LMemory.CloseSession();
+    LMemory.Free();
+  end;
+
+  // Cleanup — remove the DB file so the next run starts clean.
+  if TFile.Exists(LPath) then
+    TFile.Delete(LPath);
+
+  // --- Summary ---
+  Banner('RESULTS');
+  TVdxUtils.PrintLn(COLOR_GREEN + '  Passed: %d', [LPass]);
+  if LFail = 0 then
+    TVdxUtils.PrintLn(COLOR_GREEN + '  Failed: %d', [LFail])
+  else
+    TVdxUtils.PrintLn(COLOR_RED + '  Failed: %d', [LFail]);
+end;
+
+// ---------------------------------------------------------------------------
+// Test09_EmbeddingsRoundtrip — loads EmbeddingGemma, embeds three sentences
+// with semantic relationships, and asserts that the related pair scores
+// higher cosine similarity than either does against the unrelated sentence.
+// Proves: model loads, forward pass runs, pooling + normalize produce
+// usable vectors, and the embeddings actually capture meaning.
+// ---------------------------------------------------------------------------
+procedure Test09_EmbeddingsRoundtrip();
+const
+  CModelPath = 'C:\Dev\LLM\GGUF\embeddinggemma-300m-qat-Q8_0.gguf';
+  CTextPurple = 'I love the color purple.';
+  CTextViolet = 'My favorite hue is violet.';
+  CTextBicycle = 'How do bicycles work?';
+var
+  LEmb: TVdxEmbeddings;
+  LLoaded: Boolean;
+  LVecPurple: TArray<Single>;
+  LVecViolet: TArray<Single>;
+  LVecBicycle: TArray<Single>;
+  LSimRelated: Single;
+  LSimUnrelated1: Single;
+  LSimUnrelated2: Single;
+  LPass: Integer;
+  LFail: Integer;
+
+  procedure Banner(const AText: string);
+  begin
+    TVdxUtils.PrintLn();
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '========================================================');
+    TVdxUtils.PrintLn(COLOR_YELLOW + '  %s', [AText]);
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '========================================================');
+  end;
+
+  procedure Check(const ACond: Boolean; const ALabel: string);
+  begin
+    if ACond then
+    begin
+      Inc(LPass);
+      TVdxUtils.PrintLn(COLOR_GREEN + '  [PASS] %s', [ALabel]);
+    end
+    else
+    begin
+      Inc(LFail);
+      TVdxUtils.PrintLn(COLOR_RED + '  [FAIL] %s', [ALabel]);
+    end;
+  end;
+
+begin
+  LPass := 0;
+  LFail := 0;
+
+  TVdxUtils.PrintLn('EMBEDDINGS ROUNDTRIP - TVdxEmbeddings end-to-end test');
+  TVdxUtils.PrintLn(COLOR_WHITE + 'Model: %s', [CModelPath]);
+
+  LEmb := TVdxEmbeddings.Create();
+  try
+    LEmb.SetStatusCallback(StatusCallback, nil);
+
+    Banner('LOAD - open GGUF and build GPU pipelines');
+    LLoaded := LEmb.LoadModel(CModelPath);
+    if not LLoaded then
+    begin
+      TVdxUtils.PrintLn(COLOR_RED + 'LoadModel failed — aborting.');
+      Exit;
+    end;
+    TVdxUtils.PrintLn(COLOR_GREEN + 'Loaded. arch=%s, dim=%d, max_seq=%d',
+      [LEmb.GetArchitecture(), LEmb.GetEmbeddingDim(),
+       LEmb.GetMaxSeqLen()]);
+    Check(LEmb.IsLoaded(), 'IsLoaded() = True');
+    Check(LEmb.GetEmbeddingDim() > 0, 'GetEmbeddingDim() > 0');
+
+    Banner('EMBED - three sentences, document prefix');
+    TVdxUtils.PrintLn('  "%s"', [CTextPurple]);
+    LVecPurple := LEmb.Embed(CTextPurple, False);
+    TVdxUtils.PrintLn('  "%s"', [CTextViolet]);
+    LVecViolet := LEmb.Embed(CTextViolet, False);
+    TVdxUtils.PrintLn('  "%s"', [CTextBicycle]);
+    LVecBicycle := LEmb.Embed(CTextBicycle, False);
+
+    Check(Length(LVecPurple) = LEmb.GetEmbeddingDim(),
+      Format('purple vector length = %d', [LEmb.GetEmbeddingDim()]));
+    Check(Length(LVecViolet) = LEmb.GetEmbeddingDim(),
+      Format('violet vector length = %d', [LEmb.GetEmbeddingDim()]));
+    Check(Length(LVecBicycle) = LEmb.GetEmbeddingDim(),
+      Format('bicycle vector length = %d', [LEmb.GetEmbeddingDim()]));
+
+    Banner('SIMILARITY - cosine between pairs');
+    LSimRelated := TVdxEmbeddings.CosineSimilarity(LVecPurple, LVecViolet);
+    LSimUnrelated1 := TVdxEmbeddings.CosineSimilarity(LVecPurple, LVecBicycle);
+    LSimUnrelated2 := TVdxEmbeddings.CosineSimilarity(LVecViolet, LVecBicycle);
+
+    TVdxUtils.PrintLn(COLOR_CYAN + '  purple <-> violet   : %.4f',
+      [LSimRelated]);
+    TVdxUtils.PrintLn(COLOR_CYAN + '  purple <-> bicycle  : %.4f',
+      [LSimUnrelated1]);
+    TVdxUtils.PrintLn(COLOR_CYAN + '  violet <-> bicycle  : %.4f',
+      [LSimUnrelated2]);
+
+    Check(LSimRelated > LSimUnrelated1,
+      'sim(purple,violet) > sim(purple,bicycle)');
+    Check(LSimRelated > LSimUnrelated2,
+      'sim(purple,violet) > sim(violet,bicycle)');
+
+  finally
+    LEmb.UnloadModel();
+    LEmb.Free();
+  end;
+
+  Banner('RESULTS');
+  TVdxUtils.PrintLn(COLOR_GREEN + '  Passed: %d', [LPass]);
+  if LFail = 0 then
+    TVdxUtils.PrintLn(COLOR_GREEN + '  Failed: %d', [LFail])
+  else
+    TVdxUtils.PrintLn(COLOR_RED + '  Failed: %d', [LFail]);
+end;
+
+// ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
 // Selects which test to run via LIndex, wraps in top-level exception handler,
 // and pauses for keypress when running from the Delphi IDE so you can read
@@ -889,7 +1282,7 @@ begin
   try
     TVdxUtils.Pause('Press any key to start inference...');
 
-    LIndex := 5;
+    LIndex := 1;
 
     case LIndex of
       1: Test01();
@@ -897,6 +1290,9 @@ begin
       3: Test03();
       4: Test04();
       5: Test05();
+      6: Test06_FTS5Probe();
+      7: Test07_MemoryRoundtrip();
+      9: Test09_EmbeddingsRoundtrip();
     end;
   except
     on E: Exception do

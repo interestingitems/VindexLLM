@@ -1,0 +1,73 @@
+#version 450
+
+// Prefill Attention Scores — BIDIRECTIONAL variant.
+//
+// Identical to attn_scores_prefill.comp except NO causal mask is applied.
+// Every query token attends to every key position in [0, seq_len), in both
+// directions. This is required for encoder-style models like EmbeddingGemma,
+// which compute sentence embeddings over the full input in a single pass
+// with no generation step afterward.
+//
+// For each (q_head, q_pos_in_batch, k_pos):
+//   score = dot(Q, K) * scale   (no masking at all)
+//
+// Q layout:     [NumTokens x NumQHeads x HeadDim]
+// K cache:      [NumKVHeads x MaxSeq x HeadDim]
+// Scores:       [NumQHeads x NumTokens x MaxSeq]   (row stride = MaxSeq)
+//
+// Dispatch 3D: (ceil(SeqLen / 256), NumQHeads, NumTokens)
+//
+// Bindings and push constants match attn_scores_prefill.comp exactly so the
+// same Delphi push record (TVdxAttnScoresPrefillPush) can dispatch either
+// variant without adjustment.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint  head_dim;
+    uint  num_tokens;
+    uint  max_seq;
+    float scale;
+    uint  num_q_heads;
+    uint  gqa_ratio;
+    uint  start_pos;
+    uint  seq_len;
+} pc;
+
+layout(std430, binding = 0) readonly buffer QBuf {
+    float q_mat[];
+};
+
+layout(std430, binding = 1) readonly buffer KCacheBuf {
+    float k_cache[];
+};
+
+layout(std430, binding = 2) writeonly buffer ScoresBuf {
+    float scores[];
+};
+
+void main() {
+    uint k_pos  = gl_GlobalInvocationID.x;
+    uint q_head = gl_WorkGroupID.y;
+    uint q_pos  = gl_WorkGroupID.z;
+
+    if (k_pos >= pc.seq_len || q_head >= pc.num_q_heads || q_pos >= pc.num_tokens)
+        return;
+
+    uint score_idx = q_head * pc.num_tokens * pc.max_seq
+                   + q_pos * pc.max_seq
+                   + k_pos;
+
+    // No causal check — every query sees every key in [0, seq_len).
+
+    uint kv_head = q_head / pc.gqa_ratio;
+    uint q_off   = (q_pos * pc.num_q_heads + q_head) * pc.head_dim;
+    uint k_off   = (kv_head * pc.max_seq + k_pos) * pc.head_dim;
+
+    float acc = 0.0;
+    for (uint d = 0; d < pc.head_dim; d++) {
+        acc += q_mat[q_off + d] * k_cache[k_off + d];
+    }
+
+    scores[score_idx] = acc * pc.scale;
+}

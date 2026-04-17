@@ -36,6 +36,17 @@ type
     class function FormatPrompt(
       const AArchitecture: string;
       const APrompt: string): string;
+
+    // Format input text for an embedding model by prepending the
+    // architecture-appropriate task prefix.
+    // AIsQuery = True  → query prefix (retrieval search text)
+    // AIsQuery = False → document prefix (text being stored / indexed)
+    // BOS is NOT included — caller prepends BOS during tokenization.
+    // Unknown architectures return AText unchanged (no prefix).
+    class function FormatEmbedding(
+      const AArchitecture: string;
+      const AText: string;
+      const AIsQuery: Boolean): string;
   end;
 
 implementation
@@ -71,6 +82,31 @@ begin
       '<|im_start|>user' + #10 +
       APrompt + '<|im_end|>' + #10 +
       '<|im_start|>assistant' + #10;
+  end;
+end;
+
+class function TVdxChatTemplate.FormatEmbedding(
+  const AArchitecture: string;
+  const AText: string;
+  const AIsQuery: Boolean): string;
+begin
+  // EmbeddingGemma task prefixes come from the model's
+  // config_sentence_transformers.json — 'Retrieval-query' and
+  // 'Retrieval-document' presets. They are NOT stored in the GGUF, so we
+  // dispatch by architecture the same way FormatPrompt does for chat.
+  // Source: https://huggingface.co/google/embeddinggemma-300m
+  if AArchitecture = 'gemma-embedding' then
+  begin
+    if AIsQuery then
+      Result := 'task: search result | query: ' + AText
+    else
+      Result := 'title: none | text: ' + AText;
+  end
+  else
+  begin
+    // Unknown embedding architecture — pass text through unchanged rather
+    // than inject a prefix the model wasn't trained to recognize.
+    Result := AText;
   end;
 end;
 

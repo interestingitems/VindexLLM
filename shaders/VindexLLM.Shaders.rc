@@ -34,6 +34,9 @@ ATTN_SCORES_PREFILL     RCDATA "attn_scores_prefill.spv"
 SOFTMAX_PREFILL         RCDATA "softmax_prefill.spv"
 ATTN_VALUE_PREFILL      RCDATA "attn_value_prefill.spv"
 
+// Attention (batched prefill — bidirectional, for encoder models)
+ATTN_SCORES_PREFILL_BIDIR  RCDATA "attn_scores_prefill_bidir.spv"
+
 // KV cache store
 KV_CACHE_STORE          RCDATA "kv_cache_store.spv"
 KV_CACHE_STORE_BATCH    RCDATA "kv_cache_store_batch.spv"

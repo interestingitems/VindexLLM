@@ -62,6 +62,10 @@ rem === Attention (batched prefill — causal) ===
 %GLSLC% -V attn_scores_prefill.comp -o attn_scores_prefill.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: attn_scores_prefill.comp & exit /b 1 )
 
+rem === Attention (batched prefill — bidirectional, for encoder models) ===
+%GLSLC% -V attn_scores_prefill_bidir.comp -o attn_scores_prefill_bidir.spv
+if %ERRORLEVEL% NEQ 0 ( echo FAILED: attn_scores_prefill_bidir.comp & exit /b 1 )
+
 %GLSLC% -V softmax_prefill.comp -o softmax_prefill.spv
 if %ERRORLEVEL% NEQ 0 ( echo FAILED: softmax_prefill.comp & exit /b 1 )
 
