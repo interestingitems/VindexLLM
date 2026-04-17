@@ -60,6 +60,7 @@ const
   CVdxMemRoleAssistant: string = 'assistant';
   CVdxMemRoleSystem:    string = 'system';
   CVdxMemRoleFact:      string = 'fact';
+  CVdxMemRoleChunk:     string = 'chunk';
 
 type
 
@@ -202,6 +203,22 @@ type
     // intended for prototyping and maintenance only.
     procedure PurgeWhere(const AWhereClause: string);
 
+    // Document ingest — splits a large text into overlapping chunks and
+    // stores each as a turns row with role 'chunk'. A parent row in the
+    // documents table tracks the source metadata. Chunking is paragraph-
+    // aware: splits on blank lines first, then hard-splits paragraphs
+    // exceeding AChunkTokens. AOverlapTokens trailing words carry over
+    // between adjacent chunks. Both sizes are measured in whitespace-
+    // delimited words (no BPE tokenizer at this layer). Returns the
+    // document id. Chunks inherit the document's pinned flag.
+    function  AddDocument(const ASource, ATitle, AText: string;
+      const AChunkTokens, AOverlapTokens: Integer;
+      const APinned: Boolean = False): Int64;
+
+    // Delete a document and all its chunks. The cascade trigger on the
+    // documents table auto-deletes related turns rows.
+    procedure PurgeDocument(const ADocumentId: Int64);
+
     // Utility
     function  GetDbPath(): string;
   end;
@@ -253,6 +270,27 @@ const
     '  INSERT INTO turns_fts(turns_fts, rowid, text)' + sLineBreak +
     '    VALUES(''delete'', old.turn_id, old.text);' + sLineBreak +
     '  INSERT INTO turns_fts(rowid, text) VALUES (new.turn_id, new.text);' + sLineBreak +
+    'END';
+
+  // Parent table for document-ingest chunks. Each ingested document
+  // gets one row here; its chunks live in turns with document_id set.
+  CVdxDDLDocuments =
+    'CREATE TABLE IF NOT EXISTS documents (' + sLineBreak +
+    '  id          INTEGER PRIMARY KEY AUTOINCREMENT,' + sLineBreak +
+    '  source      TEXT    NOT NULL,' + sLineBreak +
+    '  title       TEXT    NOT NULL,' + sLineBreak +
+    '  ingested_at INTEGER NOT NULL,' + sLineBreak +
+    '  pinned      INTEGER DEFAULT 0' + sLineBreak +
+    ')';
+
+  // CASCADE delete: when a documents row is removed, all turns that
+  // reference it are automatically deleted. Implemented as a trigger
+  // because SQLite foreign keys require PRAGMA foreign_keys=ON per
+  // connection and we prefer explicit trigger-based cascades for
+  // consistency with the FTS5 sync triggers.
+  CVdxDDLTrigDocCascade =
+    'CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN' + sLineBreak +
+    '  DELETE FROM turns WHERE document_id = old.id;' + sLineBreak +
     'END';
 
   // Characters that would be interpreted as FTS5 syntax if passed raw.
@@ -345,6 +383,8 @@ begin
   FConn.ExecSQL(CVdxDDLTrigInsert);
   FConn.ExecSQL(CVdxDDLTrigDelete);
   FConn.ExecSQL(CVdxDDLTrigUpdate);
+  FConn.ExecSQL(CVdxDDLDocuments);
+  FConn.ExecSQL(CVdxDDLTrigDocCascade);
 
   // Migrations for columns added after v1 (e.g. embedding BLOB in 2.5b).
   // Kept separate from DDL above because ALTER TABLE is not idempotent
@@ -358,6 +398,7 @@ var
   LHasEmbedding: Boolean;
   LHasContentHash: Boolean;
   LHasPinned: Boolean;
+  LHasDocumentId: Boolean;
   LColName: string;
 begin
   // Probe current columns via SQLite introspection. PRAGMA table_info
@@ -365,6 +406,7 @@ begin
   LHasEmbedding := False;
   LHasContentHash := False;
   LHasPinned := False;
+  LHasDocumentId := False;
   LQuery := TFDQuery.Create(nil);
   try
     LQuery.Connection := FConn;
@@ -378,7 +420,9 @@ begin
       else if SameText(LColName, 'content_hash') then
         LHasContentHash := True
       else if SameText(LColName, 'pinned') then
-        LHasPinned := True;
+        LHasPinned := True
+      else if SameText(LColName, 'document_id') then
+        LHasDocumentId := True;
       LQuery.Next();
     end;
     LQuery.Close();
@@ -395,6 +439,8 @@ begin
     FConn.ExecSQL('ALTER TABLE turns ADD COLUMN content_hash BLOB');
   if not LHasPinned then
     FConn.ExecSQL('ALTER TABLE turns ADD COLUMN pinned INTEGER DEFAULT 0');
+  if not LHasDocumentId then
+    FConn.ExecSQL('ALTER TABLE turns ADD COLUMN document_id INTEGER');
 end;
 
 procedure TVdxMemory.LoadNextTurnIndex();
@@ -1185,6 +1231,195 @@ begin
   FConn.ExecSQL('DELETE FROM turns WHERE ' + AWhereClause);
 
   // Recalculate next turn index since we may have deleted the tail.
+  LoadNextTurnIndex();
+end;
+
+function TVdxMemory.AddDocument(const ASource, ATitle, AText: string;
+  const AChunkTokens, AOverlapTokens: Integer;
+  const APinned: Boolean): Int64;
+var
+  LDocQuery: TFDQuery;
+  LUpdateQuery: TFDQuery;
+  LDocId: Int64;
+  LNowUnix: Int64;
+  LParagraphs: TArray<string>;
+  LChunks: TList<string>;
+  LWords: TArray<string>;
+  LCurrentWords: TList<string>;
+  LParaWords: TArray<string>;
+  LChunkText: string;
+  LOverlapStart: Integer;
+  LTurnId: Int64;
+  LI: Integer;
+  LJ: Integer;
+  LK: Integer;
+  LPinInt: Integer;
+begin
+  Result := 0;
+  if not IsOpen() then
+    raise Exception.Create('TVdxMemory.AddDocument: session not open');
+  if AChunkTokens <= 0 then
+    raise Exception.Create('TVdxMemory.AddDocument: AChunkTokens must be > 0');
+  if AOverlapTokens >= AChunkTokens then
+    raise Exception.Create(
+      'TVdxMemory.AddDocument: AOverlapTokens must be < AChunkTokens');
+
+  // Insert the parent document row.
+  LNowUnix := DateTimeToUnix(Now(), False);
+  if APinned then
+    LPinInt := 1
+  else
+    LPinInt := 0;
+
+  LDocQuery := TFDQuery.Create(nil);
+  try
+    LDocQuery.Connection := FConn;
+    LDocQuery.SQL.Text :=
+      'INSERT INTO documents (source, title, ingested_at, pinned) ' +
+      'VALUES (:src, :ttl, :ts, :pin)';
+    LDocQuery.ParamByName('src').AsString := ASource;
+    LDocQuery.ParamByName('ttl').AsString := ATitle;
+    LDocQuery.ParamByName('ts').AsLargeInt := LNowUnix;
+    LDocQuery.ParamByName('pin').AsInteger := LPinInt;
+    LDocQuery.ExecSQL();
+
+    LDocQuery.SQL.Text := 'SELECT last_insert_rowid()';
+    LDocQuery.Open();
+    LDocId := LDocQuery.Fields[0].AsLargeInt;
+    LDocQuery.Close();
+  finally
+    LDocQuery.Free();
+  end;
+
+  // --- Paragraph-aware chunking ---
+  // 1. Split on blank lines (two or more consecutive newlines).
+  // 2. Accumulate paragraph words into a chunk until AChunkTokens.
+  // 3. Hard-split any single paragraph exceeding AChunkTokens.
+  // 4. Carry AOverlapTokens trailing words into the next chunk.
+
+  LParagraphs := AText.Replace(#13#10, #10).Replace(#13, #10)
+    .Split([#10#10], TStringSplitOptions.ExcludeEmpty);
+
+  LChunks := TList<string>.Create();
+  LCurrentWords := TList<string>.Create();
+  try
+    for LI := 0 to High(LParagraphs) do
+    begin
+      LParaWords := LParagraphs[LI].Split([' ', #9, #10],
+        TStringSplitOptions.ExcludeEmpty);
+
+      // If adding this paragraph would exceed the chunk size, and
+      // we already have content, emit the current chunk first.
+      if (LCurrentWords.Count > 0) and
+         (LCurrentWords.Count + Length(LParaWords) > AChunkTokens) then
+      begin
+        LChunks.Add(string.Join(' ', LCurrentWords.ToArray()));
+
+        // Carry overlap words into the next chunk.
+        if AOverlapTokens > 0 then
+        begin
+          LOverlapStart := LCurrentWords.Count - AOverlapTokens;
+          if LOverlapStart < 0 then
+            LOverlapStart := 0;
+          LWords := LCurrentWords.ToArray();
+          LCurrentWords.Clear();
+          for LJ := LOverlapStart to High(LWords) do
+            LCurrentWords.Add(LWords[LJ]);
+        end
+        else
+          LCurrentWords.Clear();
+      end;
+
+      // Hard-split: if this single paragraph exceeds AChunkTokens,
+      // feed its words through the accumulator in batches.
+      if Length(LParaWords) > AChunkTokens then
+      begin
+        for LJ := 0 to High(LParaWords) do
+        begin
+          LCurrentWords.Add(LParaWords[LJ]);
+          if LCurrentWords.Count >= AChunkTokens then
+          begin
+            LChunks.Add(string.Join(' ', LCurrentWords.ToArray()));
+            if AOverlapTokens > 0 then
+            begin
+              LOverlapStart := LCurrentWords.Count - AOverlapTokens;
+              if LOverlapStart < 0 then
+                LOverlapStart := 0;
+              LWords := LCurrentWords.ToArray();
+              LCurrentWords.Clear();
+              for LK := LOverlapStart to High(LWords) do
+                LCurrentWords.Add(LWords[LK]);
+            end
+            else
+              LCurrentWords.Clear();
+          end;
+        end;
+      end
+      else
+      begin
+        // Normal case: add paragraph words to the accumulator.
+        for LJ := 0 to High(LParaWords) do
+          LCurrentWords.Add(LParaWords[LJ]);
+      end;
+    end;
+
+    // Emit any remaining words as the final chunk.
+    if LCurrentWords.Count > 0 then
+      LChunks.Add(string.Join(' ', LCurrentWords.ToArray()));
+
+    // Insert each chunk as a turns row via AppendTurn, then UPDATE
+    // to set document_id and pinned. This reuses all existing logic
+    // (dedup, embedding, FTS5 triggers) without modifying AppendTurn.
+    LUpdateQuery := TFDQuery.Create(nil);
+    try
+      LUpdateQuery.Connection := FConn;
+      for LI := 0 to LChunks.Count - 1 do
+      begin
+        LChunkText := LChunks[LI];
+        LWords := LChunkText.Split([' '], TStringSplitOptions.ExcludeEmpty);
+        LTurnId := AppendTurn(CVdxMemRoleChunk, LChunkText, Length(LWords));
+
+        // Link the chunk to its parent document and propagate pinned.
+        LUpdateQuery.SQL.Text :=
+          'UPDATE turns SET document_id = :did, pinned = :pin ' +
+          'WHERE turn_id = :tid';
+        LUpdateQuery.ParamByName('did').AsLargeInt := LDocId;
+        LUpdateQuery.ParamByName('pin').AsInteger := LPinInt;
+        LUpdateQuery.ParamByName('tid').AsLargeInt := LTurnId;
+        LUpdateQuery.ExecSQL();
+      end;
+    finally
+      LUpdateQuery.Free();
+    end;
+  finally
+    LCurrentWords.Free();
+    LChunks.Free();
+  end;
+
+  Result := LDocId;
+end;
+
+procedure TVdxMemory.PurgeDocument(const ADocumentId: Int64);
+var
+  LQuery: TFDQuery;
+begin
+  if not IsOpen() then
+    raise Exception.Create('TVdxMemory.PurgeDocument: session not open');
+
+  // Deleting from documents fires the CVdxDDLTrigDocCascade trigger,
+  // which auto-deletes all turns with matching document_id. Those
+  // turn deletions in turn fire the FTS5 sync triggers.
+  LQuery := TFDQuery.Create(nil);
+  try
+    LQuery.Connection := FConn;
+    LQuery.SQL.Text := 'DELETE FROM documents WHERE id = :did';
+    LQuery.ParamByName('did').AsLargeInt := ADocumentId;
+    LQuery.ExecSQL();
+  finally
+    LQuery.Free();
+  end;
+
+  // Recalculate next turn index since chunks may have been at the tail.
   LoadNextTurnIndex();
 end;
 

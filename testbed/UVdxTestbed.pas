@@ -1944,6 +1944,153 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Test12_DocumentIngest — verifies document chunking, FTS5 retrieval of
+// chunks, and cascade purge via PurgeDocument. No embedder needed.
+// ---------------------------------------------------------------------------
+procedure Test12_DocumentIngest();
+const
+  CDbFile = 'test_document.db';
+  CChunkWords = 30;
+  COverlapWords = 5;
+
+  // A test document with distinct paragraphs on varied topics. Each
+  // paragraph is separated by a blank line. Total word count ~200.
+  CTestDocument =
+    'The Amazon rainforest is the largest tropical rainforest in the world. ' +
+    'It covers over five million square kilometers across nine countries in ' +
+    'South America. The biodiversity found there is unmatched anywhere else ' +
+    'on the planet with millions of species of insects and thousands of ' +
+    'species of birds and mammals.' + #10#10 +
+
+    'Quantum computing represents a fundamental shift in computational ' +
+    'paradigms. Unlike classical computers that use binary bits, quantum ' +
+    'computers leverage qubits which can exist in superposition states. ' +
+    'This allows quantum machines to solve certain problems exponentially ' +
+    'faster than traditional hardware.' + #10#10 +
+
+    'The art of sourdough bread baking has experienced a remarkable ' +
+    'renaissance in recent years. Bakers cultivate wild yeast starters ' +
+    'that ferment flour and water over days. The resulting bread has a ' +
+    'distinctive tangy flavor and chewy texture that cannot be replicated ' +
+    'by commercial yeast products.' + #10#10 +
+
+    'Volcanic eruptions on the ocean floor create hydrothermal vents that ' +
+    'support unique ecosystems. Giant tube worms, eyeless shrimp, and ' +
+    'chemosynthetic bacteria thrive in these extreme environments. These ' +
+    'communities exist entirely without sunlight, deriving energy from ' +
+    'chemical reactions involving hydrogen sulfide.' + #10#10 +
+
+    'The history of typography spans centuries from Gutenberg movable ' +
+    'type to modern digital fonts. Each typeface carries cultural weight ' +
+    'and communicates subtle meaning beyond the words themselves. Designers ' +
+    'carefully select fonts to evoke specific emotions and establish visual ' +
+    'hierarchy in their compositions.';
+
+var
+  LMemory: TVdxMemory;
+  LPath: string;
+  LDocId: Int64;
+  LTurnCount: Integer;
+  LHits: TArray<TVdxMemoryTurn>;
+  LPass: Integer;
+  LFail: Integer;
+
+  procedure Banner(const AText: string);
+  begin
+    TVdxUtils.PrintLn();
+    TVdxUtils.PrintLn(COLOR_YELLOW +
+      '=== Test12_DocumentIngest — %s ===', [AText]);
+  end;
+
+  procedure Check(const ALabel: string; const AOk: Boolean);
+  begin
+    if AOk then
+    begin
+      Inc(LPass);
+      TVdxUtils.PrintLn(COLOR_GREEN + '  [PASS] %s', [ALabel]);
+    end
+    else
+    begin
+      Inc(LFail);
+      TVdxUtils.PrintLn(COLOR_RED + '  [FAIL] %s', [ALabel]);
+    end;
+  end;
+
+begin
+  LPass := 0;
+  LFail := 0;
+  LPath := TPath.Combine(TPath.GetDirectoryName(ParamStr(0)), CDbFile);
+
+  // Clean up from any prior run.
+  if TFile.Exists(LPath) then
+    TFile.Delete(LPath);
+
+  Banner('INGEST');
+
+  LMemory := TVdxMemory.Create();
+  try
+    LMemory.OpenSession(LPath);
+    Check('Session opened', LMemory.IsOpen());
+
+    // Ingest the document — no embedder attached, chunks get NULL embeddings.
+    LDocId := LMemory.AddDocument(
+      'test.txt', 'Test Document', CTestDocument,
+      CChunkWords, COverlapWords, False);
+    Check('AddDocument returned doc id > 0', LDocId > 0);
+
+    LTurnCount := LMemory.GetTurnCount();
+    TVdxUtils.PrintLn('  Chunk count: %d', [LTurnCount]);
+    Check('At least 5 chunks created', LTurnCount >= 5);
+    Check('No more than 20 chunks created', LTurnCount <= 20);
+
+    Banner('FTS5 SEARCH');
+
+    // 'sourdough' appears only in the bread-baking paragraph.
+    LHits := LMemory.SearchFTS5('sourdough', 3);
+    Check('SearchFTS5(sourdough) returned results', Length(LHits) > 0);
+    if Length(LHits) > 0 then
+      Check('Top hit contains sourdough',
+        Pos('sourdough', LowerCase(LHits[0].Text)) > 0);
+
+    // 'hydrothermal' appears only in the ocean-floor paragraph.
+    LHits := LMemory.SearchFTS5('hydrothermal', 3);
+    Check('SearchFTS5(hydrothermal) returned results', Length(LHits) > 0);
+    if Length(LHits) > 0 then
+      Check('Top hit contains hydrothermal',
+        Pos('hydrothermal', LowerCase(LHits[0].Text)) > 0);
+
+    // All chunks should have role 'chunk'.
+    LHits := LMemory.GetRecentTurns(LTurnCount);
+    if Length(LHits) > 0 then
+      Check('First chunk has role = chunk',
+        LHits[0].Role = CVdxMemRoleChunk)
+    else
+      Check('First chunk has role = chunk', False);
+
+    Banner('PURGE');
+
+    LMemory.PurgeDocument(LDocId);
+    LTurnCount := LMemory.GetTurnCount();
+    Check('PurgeDocument removed all chunks', LTurnCount = 0);
+
+    LMemory.CloseSession();
+  finally
+    LMemory.Free();
+  end;
+
+  // Clean up.
+  if TFile.Exists(LPath) then
+    TFile.Delete(LPath);
+
+  Banner('RESULTS');
+  TVdxUtils.PrintLn(COLOR_GREEN + '  Passed: %d', [LPass]);
+  if LFail = 0 then
+    TVdxUtils.PrintLn(COLOR_GREEN + '  Failed: %d', [LFail])
+  else
+    TVdxUtils.PrintLn(COLOR_RED + '  Failed: %d', [LFail]);
+end;
+
+// ---------------------------------------------------------------------------
 // RunVdxTestbed — entry point for the testbed application.
 // Selects which test to run via LIndex, wraps in top-level exception handler,
 // and pauses for keypress when running from the Delphi IDE so you can read
@@ -1956,7 +2103,7 @@ begin
   try
     TVdxUtils.Pause('Press any key to start inference...');
 
-    LIndex := 11;
+    LIndex := 12;
 
     case LIndex of
       1: Test01();
@@ -1970,6 +2117,7 @@ begin
       9: Test09_EmbeddingsRoundtrip();
       10: Test10_RebuildThreshold();
       11: Test11_DedupPinPurge();
+      12: Test12_DocumentIngest();
     end;
   except
     on E: Exception do
