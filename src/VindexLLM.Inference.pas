@@ -159,6 +159,11 @@ type
     FVocabSize: Integer;
     FMaxSeqLen: UInt32;
 
+    // KV cache next-write position. 0 = fresh session. Persists across
+    // Generate() calls so prompts can be appended without re-feeding the
+    // prior context.
+    FCurrentPosition: UInt32;
+
     // Stop token IDs — generation stops when any of these are produced
     FStopTokenIds: TList<Integer>;
 
@@ -268,7 +273,18 @@ type
     procedure RunLayerForward(const ALayer: Integer;
       const APosition: Integer);
     procedure RunLayerForwardBatch(const ALayer: Integer;
-      const ANumTokens: UInt32);
+      const ANumTokens: UInt32; const AStartPos: UInt32);
+
+    // KV cache staging helpers.
+    // Download: GPU device-local cache → host-visible staging → caller memory.
+    // Upload:   caller memory → host-visible staging → GPU device-local cache.
+    // Caller owns the staging buffer so it can be reused across all 34×2
+    // layer transfers during one Save/Load call (avoids reallocation churn).
+    procedure DownloadLayerCache(const ALayerCache: TVdxGpuBuffer;
+      const AStaging: TVdxGpuBuffer; const ACacheBuffer: Pointer);
+    procedure UploadLayerCache(const ALayerCache: TVdxGpuBuffer;
+      const AStaging: TVdxGpuBuffer; const ACacheBuffer: Pointer);
+
     function RunUnembedding(): Integer;
     procedure FireEvent(const AEvent: TVdxInferenceEvent);
     function IsCancelled(): Boolean;
@@ -299,6 +315,31 @@ type
     procedure ClearStopTokens();
 
     procedure SetSamplerConfig(const AConfig: TVdxSamplerConfig);
+
+    // KV cache position tracking.
+    // 0 = fresh session (next Generate prefills from scratch with BOS).
+    // > 0 = continuation (next Generate prefills without BOS from this slot).
+    function GetKVCachePosition(): UInt32;
+
+    // Reset position to 0. Next Generate() call behaves as a fresh session.
+    // Does not zero GPU cache buffers — the next prefill overwrites them.
+    procedure ResetKVCache();
+
+    // Save the current KV cache state to disk. Requires a model to be
+    // loaded and FCurrentPosition > 0 (nothing useful to save at 0).
+    // Writes a header followed by all layers' TQ3 K and V caches.
+    // Returns False and populates GetErrors on any failure (model not
+    // loaded, empty cache, disk I/O). On failure GPU state is untouched.
+    function SaveKVCache(const AFilename: string): Boolean;
+
+    // Load a previously saved KV cache file into GPU caches. Validates the
+    // file header matches the currently loaded model (NumLayers, NumKVHeads,
+    // HeadDim, MaxSeqLen). On success restores FCurrentPosition. On header
+    // mismatch or file error returns False with GetErrors populated; header
+    // is validated BEFORE any GPU upload so a reject is safely non-mutating.
+    // If a read error occurs mid-load the GPU caches may be partially
+    // overwritten — call ResetKVCache to discard the corrupted state.
+    function LoadKVCache(const AFilename: string): Boolean;
 
     // Stats from last Generate() call — pointer to internal record
     function GetStats(): PVdxInferenceStats;
@@ -337,6 +378,7 @@ begin
   FLogitsVBuf := nil;
   FEmbedPtr := nil;
   FEmbedScale := 0.0;
+  FCurrentPosition := 0;
 end;
 
 destructor TVdxInference.Destroy();
@@ -627,7 +669,7 @@ begin
 end;
 
 procedure TVdxInference.RunLayerForwardBatch(const ALayer: Integer;
-  const ANumTokens: UInt32);
+  const ANumTokens: UInt32; const AStartPos: UInt32);
 var
   LTheta: Single;
   LGeluPush: TVdxGeluMulPush;
@@ -649,7 +691,7 @@ begin
   // Full batched attention: FWorkMat → FAttnOutMatBuf
   FAttn.ForwardBatch(FWorkMat, FAttnWeights[ALayer],
     FNormWeights[ALayer].QNormGpu, FNormWeights[ALayer].KNormGpu,
-    ALayer, ANumTokens, LTheta,
+    ALayer, ANumTokens, AStartPos, LTheta,
     FQMat, FKMat, FVMat, FAttnOutMatBuf);
 
   // PostAttnNorm batch on attention output
@@ -829,9 +871,9 @@ begin
     [LKVTotal div (1024 * 1024), FNumLayers, FMaxSeqLen]);
 
   // Init VRAM usage accumulators
-  LVramWeights := 0;
+  //LVramWeights := 0;
   LVramCache := LKVTotal;
-  LVramBuffers := 0;
+  //LVramBuffers := 0;
 
   // Detect weight tensor type (F16, Q4_0, etc.) from first layer's Q weight
   FWeightType := LQInfo.TensorType;
@@ -1245,6 +1287,328 @@ begin
   Result := @FStats;
 end;
 
+procedure TVdxInference.DownloadLayerCache(const ALayerCache: TVdxGpuBuffer;
+  const AStaging: TVdxGpuBuffer; const ACacheBuffer: Pointer);
+var
+  LSize: UInt64;
+begin
+  LSize := FAttn.GetLayerKVCacheTQ3Bytes();
+
+  // GPU device-local → host-visible staging. CopyBuffer submits on the
+  // compute queue and waits for completion before returning, so the
+  // staging buffer is guaranteed to hold the latest data when we map it.
+  FCompute.CopyBuffer(ALayerCache, AStaging, LSize);
+
+  // Staging → caller's memory (map, Move, unmap).
+  FCompute.DownloadFromBuffer(AStaging, ACacheBuffer, LSize);
+end;
+
+procedure TVdxInference.UploadLayerCache(const ALayerCache: TVdxGpuBuffer;
+  const AStaging: TVdxGpuBuffer; const ACacheBuffer: Pointer);
+var
+  LSize: UInt64;
+begin
+  LSize := FAttn.GetLayerKVCacheTQ3Bytes();
+
+  // Caller's memory → host-visible staging (map, Move, unmap).
+  FCompute.UploadToBuffer(AStaging, ACacheBuffer, LSize);
+
+  // Staging → GPU device-local. CopyBuffer waits for transfer completion.
+  FCompute.CopyBuffer(AStaging, ALayerCache, LSize);
+end;
+
+function TVdxInference.GetKVCachePosition(): UInt32;
+begin
+  Result := FCurrentPosition;
+end;
+
+procedure TVdxInference.ResetKVCache();
+begin
+  FCurrentPosition := 0;
+end;
+
+type
+  // On-disk header for KV cache save files. Packed 64 bytes exactly.
+  // Little-endian on x64 — no byte-swapping needed. Do NOT rearrange
+  // fields without bumping CVdxKVCacheVersion.
+  TVdxKVCacheHeader = packed record
+    Magic: UInt32;              // 'VKVC' (little-endian)
+    Version: UInt32;            // = 1
+    NumLayers: UInt32;
+    NumKVHeads: UInt32;
+    HeadDim: UInt32;
+    MaxSeqLen: UInt32;
+    CurrentPosition: UInt32;
+    Reserved: UInt32;           // must be 0
+    ModelFingerprint: array[0..31] of Byte;  // all-zero in v1
+  end;
+
+const
+  // 'VKVC' packed little-endian: V=$56, K=$4B, V=$56, C=$43
+  CVdxKVCacheMagic: UInt32 = $43564B56;
+  CVdxKVCacheVersion: UInt32 = 1;
+
+function TVdxInference.SaveKVCache(const AFilename: string): Boolean;
+var
+  LHeader: TVdxKVCacheHeader;
+  LStream: TFileStream;
+  LStaging: TVdxGpuBuffer;
+  LLayerBuf: Pointer;
+  LSize: UInt64;
+  LLayer: Integer;
+begin
+  Result := False;
+  FErrors.Clear();
+
+  if not FModelLoaded then
+  begin
+    FErrors.Add(esError, 'SAVE', 'Model not loaded');
+    Exit;
+  end;
+
+  if FCurrentPosition = 0 then
+  begin
+    FErrors.Add(esError, 'SAVE',
+      'KV cache is empty (position = 0) — nothing to save');
+    Exit;
+  end;
+
+  // Build header
+  FillChar(LHeader, SizeOf(LHeader), 0);
+  LHeader.Magic := CVdxKVCacheMagic;
+  LHeader.Version := CVdxKVCacheVersion;
+  LHeader.NumLayers := FNumLayers;
+  LHeader.NumKVHeads := FNumKVHeads;
+  LHeader.HeadDim := FHeadDim;
+  LHeader.MaxSeqLen := FMaxSeqLen;
+  LHeader.CurrentPosition := FCurrentPosition;
+  // Reserved + ModelFingerprint stay zero
+
+  LSize := FAttn.GetLayerKVCacheTQ3Bytes();
+
+  // Staging buffer reused across all NumLayers*2 layer transfers
+  LStaging := FCompute.CreateGpuBuffer(
+    LSize,
+    VK_BUFFER_USAGE_TRANSFER_SRC_BIT or VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  try
+    GetMem(LLayerBuf, LSize);
+    try
+      try
+        LStream := TFileStream.Create(AFilename, fmCreate);
+        try
+          LStream.WriteBuffer(LHeader, SizeOf(LHeader));
+
+          for LLayer := 0 to Integer(FNumLayers) - 1 do
+          begin
+            // K cache for this layer
+            DownloadLayerCache(FAttn.GetLayerKCacheTQ3(LLayer),
+              LStaging, LLayerBuf);
+            LStream.WriteBuffer(LLayerBuf^, LSize);
+
+            // V cache for this layer
+            DownloadLayerCache(FAttn.GetLayerVCacheTQ3(LLayer),
+              LStaging, LLayerBuf);
+            LStream.WriteBuffer(LLayerBuf^, LSize);
+          end;
+        finally
+          LStream.Free();
+        end;
+
+        Result := True;
+      except
+        on E: Exception do
+        begin
+          FErrors.Add(esError, 'SAVE',
+            'Failed to write %s: %s', [AFilename, E.Message]);
+          Result := False;
+        end;
+      end;
+    finally
+      FreeMem(LLayerBuf);
+    end;
+  finally
+    FCompute.DestroyGpuBuffer(LStaging);
+  end;
+end;
+
+function TVdxInference.LoadKVCache(const AFilename: string): Boolean;
+var
+  LHeader: TVdxKVCacheHeader;
+  LStream: TFileStream;
+  LStaging: TVdxGpuBuffer;
+  LLayerBuf: Pointer;
+  LSize: UInt64;
+  LExpectedPayload: UInt64;
+  LLayer: Integer;
+  LCurrentLayer: Integer;   // tracks loop progress for error reporting
+begin
+  Result := False;
+  FErrors.Clear();
+
+  if not FModelLoaded then
+  begin
+    FErrors.Add(esError, 'LOAD', 'Model not loaded');
+    Exit;
+  end;
+
+  LSize := FAttn.GetLayerKVCacheTQ3Bytes();
+  LExpectedPayload := UInt64(FNumLayers) * 2 * LSize;
+
+  // Validate header BEFORE touching any GPU state so a reject is
+  // guaranteed non-mutating.
+  try
+    LStream := TFileStream.Create(AFilename, fmOpenRead or fmShareDenyWrite);
+  except
+    on E: Exception do
+    begin
+      FErrors.Add(esError, 'LOAD',
+        'Failed to open %s: %s', [AFilename, E.Message]);
+      Exit;
+    end;
+  end;
+
+  try
+    try
+      if LStream.Size < SizeOf(LHeader) then
+      begin
+        FErrors.Add(esError, 'LOAD',
+          'File too small to contain header (%d bytes)', [LStream.Size]);
+        Exit;
+      end;
+
+      LStream.ReadBuffer(LHeader, SizeOf(LHeader));
+
+      if LHeader.Magic <> CVdxKVCacheMagic then
+      begin
+        FErrors.Add(esError, 'LOAD',
+          'Bad magic: expected VKVC, got $%08x', [LHeader.Magic]);
+        Exit;
+      end;
+
+      if LHeader.Version <> CVdxKVCacheVersion then
+      begin
+        FErrors.Add(esError, 'LOAD',
+          'Unsupported version %d (this build reads version %d)',
+          [LHeader.Version, CVdxKVCacheVersion]);
+        Exit;
+      end;
+
+      if LHeader.Reserved <> 0 then
+      begin
+        FErrors.Add(esError, 'LOAD',
+          'Corrupt header: reserved field is nonzero (%d)',
+          [LHeader.Reserved]);
+        Exit;
+      end;
+
+      if LHeader.NumLayers <> FNumLayers then
+      begin
+        FErrors.Add(esError, 'LOAD',
+          'Model layer count mismatch: file=%d, model=%d',
+          [LHeader.NumLayers, FNumLayers]);
+        Exit;
+      end;
+
+      if LHeader.NumKVHeads <> FNumKVHeads then
+      begin
+        FErrors.Add(esError, 'LOAD',
+          'KV head count mismatch: file=%d, model=%d',
+          [LHeader.NumKVHeads, FNumKVHeads]);
+        Exit;
+      end;
+
+      if LHeader.HeadDim <> FHeadDim then
+      begin
+        FErrors.Add(esError, 'LOAD',
+          'Head dimension mismatch: file=%d, model=%d',
+          [LHeader.HeadDim, FHeadDim]);
+        Exit;
+      end;
+
+      if LHeader.MaxSeqLen <> FMaxSeqLen then
+      begin
+        FErrors.Add(esError, 'LOAD',
+          'Max sequence length mismatch: file=%d, model=%d',
+          [LHeader.MaxSeqLen, FMaxSeqLen]);
+        Exit;
+      end;
+
+      if LHeader.CurrentPosition > FMaxSeqLen then
+      begin
+        FErrors.Add(esError, 'LOAD',
+          'Invalid current position %d exceeds max %d',
+          [LHeader.CurrentPosition, FMaxSeqLen]);
+        Exit;
+      end;
+
+      if UInt64(LStream.Size - SizeOf(LHeader)) < LExpectedPayload then
+      begin
+        FErrors.Add(esError, 'LOAD',
+          'File truncated: payload %d bytes, expected %d',
+          [LStream.Size - SizeOf(LHeader), LExpectedPayload]);
+        Exit;
+      end;
+
+      // All validation passed. Now mutate GPU state.
+      LStaging := FCompute.CreateGpuBuffer(
+        LSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT or VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+      try
+        GetMem(LLayerBuf, LSize);
+        try
+          // Initialize before the loop so it's always defined in the
+          // except block, even if an exception fires on the very first
+          // ReadBuffer call or if FNumLayers happens to be 0.
+          LCurrentLayer := 0;
+          try
+            for LLayer := 0 to Integer(FNumLayers) - 1 do
+            begin
+              LCurrentLayer := LLayer;
+
+              // K cache for this layer
+              LStream.ReadBuffer(LLayerBuf^, LSize);
+              UploadLayerCache(FAttn.GetLayerKCacheTQ3(LLayer),
+                LStaging, LLayerBuf);
+
+              // V cache for this layer
+              LStream.ReadBuffer(LLayerBuf^, LSize);
+              UploadLayerCache(FAttn.GetLayerVCacheTQ3(LLayer),
+                LStaging, LLayerBuf);
+            end;
+
+            // Only commit position after ALL layers uploaded successfully.
+            FCurrentPosition := LHeader.CurrentPosition;
+            Result := True;
+          except
+            on E: Exception do
+            begin
+              FErrors.Add(esError, 'LOAD',
+                'Read failed mid-load at layer %d: %s (GPU state partially overwritten; call ResetKVCache to recover)',
+                [LCurrentLayer, E.Message]);
+              Result := False;
+            end;
+          end;
+        finally
+          FreeMem(LLayerBuf);
+        end;
+      finally
+        FCompute.DestroyGpuBuffer(LStaging);
+      end;
+    except
+      on E: Exception do
+      begin
+        FErrors.Add(esError, 'LOAD',
+          'Unexpected error: %s', [E.Message]);
+        Result := False;
+      end;
+    end;
+  finally
+    LStream.Free();
+  end;
+end;
+
 function TVdxInference.Generate(const APrompt: string;
   const AMaxTokens: Integer): string;
 var
@@ -1276,16 +1640,22 @@ begin
   // Format prompt with chat template
   LFormatted := TVdxChatTemplate.FormatPrompt(FArchitecture, APrompt);
 
-  // Tokenize (with BOS)
-  LTokenIds := FTokenizer.Encode(LFormatted, True);
+  // Tokenize. Only add BOS on fresh sessions — continuations must NOT
+  // restart the token stream, otherwise the model sees a spurious begin-of-
+  // sequence marker mid-conversation.
+  LTokenIds := FTokenizer.Encode(LFormatted, FCurrentPosition = 0);
   LTokenCount := Length(LTokenIds);
 
-  // Guard: prompt must fit within context window
-  if LTokenCount > Integer(FMaxSeqLen) then
+  // Guard: current position + prompt tokens + max generation budget must
+  // fit within the context window. Overflow returns srContextFull without
+  // mutating any state (no partial prefill, no FCurrentPosition change).
+  if UInt64(FCurrentPosition) + UInt64(LTokenCount) + UInt64(AMaxTokens)
+    > UInt64(FMaxSeqLen) then
   begin
+    FStats.StopReason := srContextFull;
     FErrors.Add(esError, 'GEN',
-      'Prompt too long: %d tokens exceeds max context %d',
-      [LTokenCount, FMaxSeqLen]);
+      'Context overflow: pos=%d + prompt=%d + max=%d exceeds max context %d',
+      [FCurrentPosition, LTokenCount, AMaxTokens, FMaxSeqLen]);
     Exit;
   end;
 
@@ -1307,9 +1677,15 @@ begin
         FStats.StopReason := srCancelled;
         Break;
       end;
-      RunLayerForwardBatch(LLayer, UInt32(LTokenCount));
+      RunLayerForwardBatch(LLayer, UInt32(LTokenCount), FCurrentPosition);
     end;
     FCompute.EndBatch();
+
+    // Advance write position past the prefilled tokens. Only on success —
+    // a cancelled prefill leaves FCurrentPosition untouched so the next
+    // Generate() can cleanly retry from the same state.
+    if FStats.StopReason <> srCancelled then
+      FCurrentPosition := FCurrentPosition + UInt32(LTokenCount);
 
     // Copy last token's residual from matrix to vector for generation handoff
     FCompute.CopyBufferRegion(
@@ -1332,8 +1708,8 @@ begin
       LGenWatch := TStopwatch.StartNew();
       while LGenerated < AMaxTokens do
     begin
-      // Check context overflow
-      if UInt32(LTokenCount + LGenerated) >= FMaxSeqLen then
+      // Check context overflow using absolute cache position.
+      if FCurrentPosition >= FMaxSeqLen then
       begin
         FStats.StopReason := srContextFull;
         Break;
@@ -1370,9 +1746,9 @@ begin
       if FTokenCallback.IsAssigned() then
         FTokenCallback.Callback(LTokenStr, FTokenCallback.UserData);
 
-      // Feed predicted token back into the model
-      Inc(LGenerated);
-
+      // Feed predicted token back into the model at its new KV slot.
+      // RunLayerForward interprets APosition as the absolute slot being
+      // written; attention then reads keys [0 .. APosition].
       FCompute.BeginBatch();
       EmbedToken(LNextTokenId);
       for LLayer := 0 to Integer(FNumLayers) - 1 do
@@ -1382,13 +1758,18 @@ begin
           FStats.StopReason := srCancelled;
           Break;
         end;
-        RunLayerForward(LLayer, LTokenCount + LGenerated - 1);
+        RunLayerForward(LLayer, Integer(FCurrentPosition));
       end;
       FCompute.EndBatch();
 
-      // Break outer loop if cancelled during forward pass
+      // Break outer loop if cancelled during forward pass — do NOT advance
+      // FCurrentPosition since the write was interrupted.
       if FStats.StopReason = srCancelled then
         Break;
+
+      // Successful token write. Advance past this slot and count it.
+      FCurrentPosition := FCurrentPosition + 1;
+      Inc(LGenerated);
     end;
     LGenWatch.Stop();
     FireEvent(ieGenerateEnd);
@@ -1546,6 +1927,7 @@ begin
   FResidual := nil;
   FEmbedPtr := nil;
   FModelLoaded := False;
+  FCurrentPosition := 0;
 
   FireEvent(ieUnloadEnd);
   Status('Model unloaded');
