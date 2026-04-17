@@ -125,6 +125,12 @@ type
     function Chat(const AUserMessage: string;
       const AMaxTokens: Integer = 256): string;
 
+    // Reset conversation state — clears the KV cache, purges all turns
+    // from memory, and resets the turn index. The next Chat() call
+    // behaves as a fresh session (BOS, system prompt injected again).
+    // Memory DB schema stays intact; only data is cleared.
+    procedure ClearHistory();
+
     // --- Knowledge ---
     function AddDocument(const ASource: string; const ATitle: string;
       const AText: string; const AChunkTokens: Integer = 512;
@@ -425,6 +431,17 @@ begin
   Inc(FTurnIndex, 2);
 
   Result := LResponse;
+end;
+
+procedure TVdxSession.ClearHistory();
+begin
+  if not IsLoaded() then
+    Exit;
+
+  FInference.ResetKVCache();
+  FMemory.PurgeAll();
+  FTurnIndex := 0;
+  FLastUserMessage := '';
 end;
 
 // ---------------------------------------------------------------------------
