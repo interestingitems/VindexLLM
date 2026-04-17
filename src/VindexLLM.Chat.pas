@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -25,10 +25,7 @@ uses
   VindexLLM.Sampler;
 
 type
-  { TVdxChat — base class for interactive chat applications.
-    Owns a TVdxSession and drives the template-method lifecycle:
-    startup → load → input loop → unload → shutdown.
-    Derived classes override abstract I/O methods and optional hooks. }
+  { TVdxChat }
   TVdxChat = class(TVdxBaseObject)
   private
     FSession: TVdxSession;
@@ -141,9 +138,6 @@ destructor TVdxChat.Destroy();
 begin
   inherited Destroy();
 end;
-// ---------------------------------------------------------------------------
-// Virtual hooks — default implementations
-// ---------------------------------------------------------------------------
 
 procedure TVdxChat.DoStatus(const AText: string);
 begin
@@ -185,10 +179,6 @@ begin
   Result := FSession;
 end;
 
-// ---------------------------------------------------------------------------
-// PrintErrors — outputs session errors/warnings via DoInfo
-// ---------------------------------------------------------------------------
-
 procedure TVdxChat.PrintErrors();
 var
   LErrors: TVdxErrors;
@@ -211,9 +201,6 @@ begin
       [LErr.GetSeverityString(), LErr.Code, LErr.Message]));
   end;
 end;
-// ---------------------------------------------------------------------------
-// Run — template method lifecycle
-// ---------------------------------------------------------------------------
 
 procedure TVdxChat.Run();
 var
@@ -283,10 +270,6 @@ begin
 
   DoShutdown();
 end;
-
-// ---------------------------------------------------------------------------
-// ProcessCommand — parse and dispatch slash commands
-// ---------------------------------------------------------------------------
 
 procedure TVdxChat.ProcessCommand(const AInput: string);
 var
@@ -381,10 +364,6 @@ begin
   end;
 end;
 
-// ---------------------------------------------------------------------------
-// ProcessChat — send user message to session and generate response
-// ---------------------------------------------------------------------------
-
 procedure TVdxChat.ProcessChat(const AInput: string);
 var
   LResponse: string;
@@ -418,9 +397,6 @@ begin
       DoInfo('[DEBUG] Empty response. No stats available.');
   end;
 end;
-// ---------------------------------------------------------------------------
-// PrintHelp — list available commands
-// ---------------------------------------------------------------------------
 
 procedure TVdxChat.PrintHelp();
 begin
@@ -435,9 +411,6 @@ begin
   DoInfo('  /tokens <n>        Set max generation tokens');
   DoInfo('  /help              Show this help');
 end;
-// ---------------------------------------------------------------------------
-// PrintStats — format and display inference statistics
-// ---------------------------------------------------------------------------
 
 procedure TVdxChat.PrintStats();
 var

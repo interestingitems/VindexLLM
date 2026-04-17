@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -70,10 +70,7 @@ type
     const AEvent: TVdxEmbeddingsEvent;
     const AUserData: Pointer);
 
-  { TVdxEmbeddings — loads an embedding-style transformer (EmbeddingGemma)
-    and produces L2-normalized vectors for arbitrary text. Mirrors the
-    subsystem layout of TVdxInference but runs a single forward pass
-    that ends in mean-pooling + normalization instead of unembedding. }
+  { TVdxEmbeddings }
   TVdxEmbeddings = class(TVdxErrorsObject)
   private
     // Subsystem objects — same set as TVdxInference, independent instances

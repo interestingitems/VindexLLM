@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -64,14 +64,7 @@ const
 
 type
 
-  { TVdxMemoryTurn — a single conversational turn as stored in the
-    long-term memory DB. Returned by reads and searches. Score and
-    CosineScore carry relevance signals from the two search APIs:
-      * Score       — BM25 rank from SearchFTS5 (lower = more relevant)
-      * CosineScore — cosine similarity from SearchVector (higher = more relevant)
-    Both default to zero on non-search reads. Keeping them as separate
-    fields avoids the footgun of a single field whose meaning flips
-    depending on which search method produced it. }
+  { TVdxMemoryTurn }
   TVdxMemoryTurn = record
     TurnId      : Int64;
     TurnIndex   : Integer;
@@ -84,11 +77,8 @@ type
     Pinned      : Boolean;  // true if turn is pinned (survives rebuild aging)
   end;
 
-  { TVdxMemory — SQLite + FTS5-backed turn journal for one conversation
-    session. One DB file per session. Append-only from the caller's
-    view; the FTS5 index stays in sync via triggers declared in the
-    schema. Static FireDAC SQLite linkage — no sqlite3.dll deployment. }
-  TVdxMemory = class(TVdxBaseObject)
+  { TVdxMemory }
+  TVdxMemory = class(TVdxErrorsObject)
   private
     FLink: TFDPhysSQLiteDriverLink;
     FConn: TFDConnection;
@@ -225,6 +215,30 @@ type
 
 implementation
 
+uses
+  VindexLLM.Resources;
+
+const
+  // Error codes — user-facing messages live in VindexLLM.Resources.
+  VDX_ERROR_MEM_NOT_OPEN          = 'M001';
+  VDX_ERROR_MEM_DBPATH_EMPTY      = 'M002';
+  VDX_ERROR_MEM_EMBEDDER_NIL      = 'M003';
+  VDX_ERROR_MEM_EMBEDDER_NOT_LOADED = 'M004';
+  VDX_ERROR_MEM_EMBEDDER_DETACHED = 'M005';
+  VDX_ERROR_MEM_NO_EMBEDDER       = 'M006';
+  VDX_ERROR_MEM_EMBEDDING_MISMATCH = 'M007';
+  VDX_ERROR_MEM_WHERE_EMPTY       = 'M008';
+  VDX_ERROR_MEM_CHUNK_INVALID     = 'M009';
+  VDX_ERROR_MEM_OVERLAP_INVALID   = 'M010';
+
+  // Fuzzy semantic dedup: if an incoming turn's embedding has cosine
+  // similarity above this threshold against any of the last N existing
+  // embeddings, treat it as a near-duplicate and skip the insert.
+  // 0.97 catches punctuation-only and light-paraphrase dupes while
+  // leaving genuinely distinct statements alone.
+  CVdxFuzzyDupThreshold    = 0.97;
+  CVdxFuzzyDupScanLimit    = 50;
+
 const
   CVdxDDLTurns =
     'CREATE TABLE IF NOT EXISTS turns (' + sLineBreak +
@@ -299,6 +313,7 @@ const
     '?', '!', ',', '.', ';', '[', ']', '{', '}', '<', '>', '@', '#', '$',
     '%', '&', '=', '~', '\', '/', '|'];
 
+{ TVdxMemory }
 constructor TVdxMemory.Create();
 begin
   inherited Create();
@@ -329,6 +344,12 @@ end;
 function TVdxMemory.OpenSession(const ADbPath: string): Boolean;
 begin
   Result := False;
+
+  if ADbPath.IsEmpty() then
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_DBPATH_EMPTY, RSMemDbPathEmpty);
+    Exit;
+  end;
 
   // Idempotent re-open: silently close an existing session first.
   if IsOpen() then
@@ -467,7 +488,10 @@ var
   LQuery: TFDQuery;
 begin
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.SetMeta: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
 
   LQuery := TFDQuery.Create(nil);
   try
@@ -489,7 +513,10 @@ var
 begin
   Result := '';
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.GetMeta: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
 
   LQuery := TFDQuery.Create(nil);
   try
@@ -513,11 +540,15 @@ begin
   // and SearchVector to cover the case where the caller unloads the
   // embedder after attach.
   if AEmbedder = nil then
-    raise Exception.Create(
-      'TVdxMemory.AttachEmbeddings: embedder is nil');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_EMBEDDER_NIL, RSMemEmbedderNil);
+    Exit;
+  end;
   if not AEmbedder.IsLoaded() then
-    raise Exception.Create(
-      'TVdxMemory.AttachEmbeddings: embedder is not loaded');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_EMBEDDER_NOT_LOADED, RSMemEmbedderNotLoaded);
+    Exit;
+  end;
 
   FEmbedder := AEmbedder;
   FEmbedderDim := AEmbedder.GetEmbeddingDim();
@@ -543,19 +574,29 @@ var
   LHash: TBytes;
   LHashStream: TBytesStream;
   LDupQuery: TFDQuery;
+  LFuzzyQuery: TFDQuery;
+  LFuzzyStream: TStream;
+  LFuzzyBlob: TBytes;
+  LFuzzyRowVec: TArray<Single>;
+  LFuzzyHit: Boolean;
+  LFuzzyHitId: Int64;
 begin
   Result := 0;
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.AppendTurn: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
 
   // Per-use guard: if an embedder was attached but has since been
   // unloaded, surface that explicitly. Silent fallback to NULL would
   // hide a real bug in caller setup — they should DetachEmbeddings
   // before unloading the embedder model.
   if (FEmbedder <> nil) and (not FEmbedder.IsLoaded()) then
-    raise Exception.Create(
-      'TVdxMemory.AppendTurn: attached embedder is no longer loaded — ' +
-      'call DetachEmbeddings before unloading the embedder');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_EMBEDDER_DETACHED, RSMemEmbedderDetached);
+    Exit;
+  end;
 
   // Exact-duplicate suppression: compute SHA-256 of normalized text and
   // check if a row with the same hash already exists. If so, return the
@@ -625,6 +666,60 @@ begin
       // silently saving a turn with NULL embedding on an embed failure
       // would mask a real problem in the embedder.
       LVec := FEmbedder.Embed(AText, False);
+
+      // Fuzzy semantic dedup — compare the new embedding against the
+      // most recent existing embeddings. If cosine >= threshold, treat
+      // as a near-duplicate and reuse the existing turn_id. Catches
+      // punctuation-only and light-paraphrase dupes that the SHA-256
+      // content-hash misses.
+      LFuzzyHit := False;
+      LFuzzyHitId := 0;
+      LFuzzyQuery := TFDQuery.Create(nil);
+      try
+        LFuzzyQuery.Connection := FConn;
+        LFuzzyQuery.SQL.Text :=
+          'SELECT turn_id, embedding FROM turns ' +
+          'WHERE embedding IS NOT NULL ' +
+          'ORDER BY turn_id DESC LIMIT :lim';
+        LFuzzyQuery.ParamByName('lim').AsInteger := CVdxFuzzyDupScanLimit;
+        LFuzzyQuery.Open();
+        while (not LFuzzyQuery.Eof) and (not LFuzzyHit) do
+        begin
+          LFuzzyStream := LFuzzyQuery.CreateBlobStream(
+            LFuzzyQuery.FieldByName('embedding'), bmRead);
+          try
+            SetLength(LFuzzyBlob, LFuzzyStream.Size);
+            if LFuzzyStream.Size > 0 then
+              LFuzzyStream.ReadBuffer(LFuzzyBlob[0], LFuzzyStream.Size);
+          finally
+            LFuzzyStream.Free();
+          end;
+
+          if Length(LFuzzyBlob) = FEmbedderDim * SizeOf(Single) then
+          begin
+            LFuzzyRowVec := BytesToSingleArray(LFuzzyBlob);
+            if CosineDot(LVec, LFuzzyRowVec) >= CVdxFuzzyDupThreshold then
+            begin
+              LFuzzyHit := True;
+              LFuzzyHitId :=
+                LFuzzyQuery.FieldByName('turn_id').AsLargeInt;
+            end;
+          end;
+
+          if not LFuzzyHit then
+            LFuzzyQuery.Next();
+        end;
+        LFuzzyQuery.Close();
+      finally
+        LFuzzyQuery.Free();
+      end;
+
+      if LFuzzyHit then
+      begin
+        Result := LFuzzyHitId;
+        Exit;
+      end;
+
       LBytes := SingleArrayToBytes(LVec);
       // TFDParam.AsBytes is an indexed property (for array params), not
       // a scalar setter — so we bind via a TBytesStream + LoadFromStream
@@ -727,12 +822,12 @@ var
   LInSpace: Boolean;
   LBuf: TStringBuilder;
 begin
-  // Lowercase + collapse all whitespace runs to a single space + trim.
-  // Used to produce a canonical form for SHA-256 dedup hashing so that
-  // trivial formatting differences don't defeat exact-match detection.
+  // Lowercase + collapse whitespace + drop punctuation + trim.
+  // Keeps letters and digits only so trivial differences (trailing '?',
+  // '.', '!', commas, smart quotes) don't defeat the content-hash dedup.
   LBuf := TStringBuilder.Create(Length(AText));
   try
-    LInSpace := True; // true = suppress leading spaces
+    LInSpace := True;
     LLen := Length(AText);
     for LI := 1 to LLen do
     begin
@@ -745,11 +840,14 @@ begin
           LInSpace := True;
         end;
       end
-      else
+      else if ((LCh >= 'A') and (LCh <= 'Z')) or
+              ((LCh >= 'a') and (LCh <= 'z')) or
+              ((LCh >= '0') and (LCh <= '9')) then
       begin
         LBuf.Append(LowerCase(LCh));
         LInSpace := False;
       end;
+      // Everything else (punctuation, symbols, emoji) silently dropped
     end;
     Result := Trim(LBuf.ToString());
   finally
@@ -812,7 +910,10 @@ var
 begin
   Result := 0;
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.GetTurnCount: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
 
   LQuery := TFDQuery.Create(nil);
   try
@@ -835,7 +936,10 @@ var
 begin
   Result := nil;
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.GetRecentTurns: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
   if ACount <= 0 then
     Exit;
 
@@ -924,7 +1028,10 @@ var
 begin
   Result := nil;
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.SearchFTS5: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
   if ATopK <= 0 then
     Exit;
 
@@ -989,15 +1096,20 @@ begin
   // Checked separately so the error message tells the caller exactly
   // which precondition failed.
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.SearchVector: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
   if FEmbedder = nil then
-    raise Exception.Create(
-      'TVdxMemory.SearchVector: no embedder attached — ' +
-      'call AttachEmbeddings first');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NO_EMBEDDER, RSMemNoEmbedder);
+    Exit;
+  end;
   if not FEmbedder.IsLoaded() then
-    raise Exception.Create(
-      'TVdxMemory.SearchVector: attached embedder is no longer loaded — ' +
-      'call DetachEmbeddings before unloading the embedder');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_EMBEDDER_DETACHED, RSMemEmbedderDetached);
+    Exit;
+  end;
 
   // Mirror SearchFTS5 semantics — a non-positive top-K returns empty
   // rather than raising. Keeps the two search APIs interchangeable
@@ -1043,10 +1155,12 @@ begin
       // producing garbage similarity scores would be far worse than
       // surfacing the bug to the caller.
       if Length(LBlob) <> LExpectedLen then
-        raise Exception.CreateFmt(
-          'TVdxMemory.SearchVector: embedding byte length mismatch ' +
-          '(got %d, expected %d for dim %d) — embedder dim changed mid-DB',
+      begin
+        FErrors.Add(esError, VDX_ERROR_MEM_EMBEDDING_MISMATCH,
+          RSMemEmbeddingMismatch,
           [Length(LBlob), LExpectedLen, FEmbedderDim]);
+        Exit;
+      end;
 
       LRowVec := BytesToSingleArray(LBlob);
 
@@ -1099,13 +1213,17 @@ var
 begin
   Result := 0;
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.AddFact: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
 
   // Same embedder guard as AppendTurn.
   if (FEmbedder <> nil) and (not FEmbedder.IsLoaded()) then
-    raise Exception.Create(
-      'TVdxMemory.AddFact: attached embedder is no longer loaded — ' +
-      'call DetachEmbeddings before unloading the embedder');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_EMBEDDER_DETACHED, RSMemEmbedderDetached);
+    Exit;
+  end;
 
   // Dedup — identical to AppendTurn: skip if hash already exists.
   LHash := ComputeContentHash(AText);
@@ -1197,7 +1315,10 @@ var
   LQuery: TFDQuery;
 begin
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.PurgeTurn: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
 
   LQuery := TFDQuery.Create(nil);
   try
@@ -1213,7 +1334,10 @@ end;
 procedure TVdxMemory.PurgeAll();
 begin
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.PurgeAll: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
 
   FConn.ExecSQL('DELETE FROM turns');
   FNextTurnIndex := 0;
@@ -1222,10 +1346,15 @@ end;
 procedure TVdxMemory.PurgeWhere(const AWhereClause: string);
 begin
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.PurgeWhere: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
   if AWhereClause = '' then
-    raise Exception.Create(
-      'TVdxMemory.PurgeWhere: empty WHERE clause — use PurgeAll instead');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_WHERE_EMPTY, RSMemWhereEmpty);
+    Exit;
+  end;
 
   // WARNING: This executes a caller-supplied WHERE clause directly.
   // Intended for prototyping and maintenance only. The caller is
@@ -1259,12 +1388,20 @@ var
 begin
   Result := 0;
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.AddDocument: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
   if AChunkTokens <= 0 then
-    raise Exception.Create('TVdxMemory.AddDocument: AChunkTokens must be > 0');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_CHUNK_INVALID, RSMemChunkInvalid);
+    Exit;
+  end;
   if AOverlapTokens >= AChunkTokens then
-    raise Exception.Create(
-      'TVdxMemory.AddDocument: AOverlapTokens must be < AChunkTokens');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_OVERLAP_INVALID, RSMemOverlapInvalid);
+    Exit;
+  end;
 
   // Insert the parent document row.
   LNowUnix := DateTimeToUnix(Now(), False);
@@ -1406,7 +1543,10 @@ var
   LQuery: TFDQuery;
 begin
   if not IsOpen() then
-    raise Exception.Create('TVdxMemory.PurgeDocument: session not open');
+  begin
+    FErrors.Add(esError, VDX_ERROR_MEM_NOT_OPEN, RSMemSessionNotOpen);
+    Exit;
+  end;
 
   // Deleting from documents fires the CVdxDDLTrigDocCascade trigger,
   // which auto-deletes all turns with matching document_id. Those

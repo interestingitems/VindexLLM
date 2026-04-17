@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -21,9 +21,7 @@ uses
   VindexLLM.Chat;
 
 type
-  { TVdxConsoleChat — console-based chat derived from TVdxChat.
-    Proves the base class design with ReadLn input, ANSI-colored
-    output, ESC-key cancellation, and word-wrapping token writer. }
+  { TVdxConsoleChat }
   TVdxConsoleChat = class(TVdxChat)
   private
     FTokenWriter: TVdxConsoleTokenWriter;

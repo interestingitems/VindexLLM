@@ -92,3 +92,4 @@ checkpoint.zip
 checkpoint_base.zip
 distro.yml
 bin/session.kvc
+bin/session.db

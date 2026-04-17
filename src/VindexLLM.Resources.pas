@@ -42,6 +42,20 @@ resourcestring
   RSFatalFileReadError = 'Cannot read file ''%s'': %s';
   RSFatalInternalError = 'Internal error: %s';
 
+  //--------------------------------------------------------------------------
+  // Memory (TVdxMemory) Messages
+  //--------------------------------------------------------------------------
+  RSMemSessionNotOpen   = 'Memory session not open';
+  RSMemDbPathEmpty      = 'Memory database path is empty';
+  RSMemEmbedderNil      = 'Embedder is nil';
+  RSMemEmbedderNotLoaded = 'Embedder is not loaded';
+  RSMemEmbedderDetached = 'Attached embedder is no longer loaded — call DetachEmbeddings before unloading';
+  RSMemNoEmbedder       = 'No embedder attached — call AttachEmbeddings first';
+  RSMemEmbeddingMismatch = 'Embedding byte length mismatch (got %d, expected %d for dim %d)';
+  RSMemWhereEmpty       = 'Empty WHERE clause — use PurgeAll instead';
+  RSMemChunkInvalid     = 'AChunkTokens must be > 0';
+  RSMemOverlapInvalid   = 'AOverlapTokens must be < AChunkTokens';
+
 implementation
 
 end.

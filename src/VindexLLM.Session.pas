@@ -1,4 +1,4 @@
-{===============================================================================
+﻿{===============================================================================
   VindexLLM™ - Liberating LLM inference
 
   Copyright © 2026-present tinyBigGAMES™ LLC
@@ -42,19 +42,13 @@ const
 
 type
 
-  { TVdxRetrievalConfig — controls per-turn RAG retrieval behavior.
-    When Enabled, Chat() searches the memory DB for relevant chunks
-    and facts and injects them as context in the user prompt. }
+  { TVdxRetrievalConfig }
   TVdxRetrievalConfig = record
     Enabled: Boolean;       // master switch (default True)
     TopK: Integer;          // max retrieved items per Chat() call (default 3)
   end;
 
-  { TVdxSession — high-level inference facade that ties together
-    TVdxInference, TVdxMemory, and TVdxEmbeddings. The caller creates
-    one instance, loads a model, and has a multi-turn conversation via
-    Chat(). Turn logging, prompt formatting, context rebuild, and
-    retrieval assembly happen behind the scenes. }
+  { TVdxSession }
   TVdxSession = class(TVdxErrorsObject)
   private
     // Owned subsystems — created/destroyed by TVdxSession
@@ -171,10 +165,6 @@ begin
   inherited Destroy();
 end;
 
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
-
 function TVdxSession.LoadModel(const AModelPath: string;
   const AMemoryDbPath: string; const AEmbedderPath: string;
   const AMaxContext: Integer; const ARebuildAt: Integer): Boolean;
@@ -223,6 +213,7 @@ begin
 
   // --- Create and open memory DB ---
   FMemory := TVdxMemory.Create();
+  FMemory.SetErrors(FErrors);
   LOpened := FMemory.OpenSession(AMemoryDbPath);
   if not LOpened then
   begin
@@ -321,11 +312,6 @@ begin
   Result := Assigned(FInference) and Assigned(FMemory);
 end;
 
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
 procedure TVdxSession.SetSystemPrompt(const APrompt: string);
 begin
   FSystemPrompt := APrompt;
@@ -366,11 +352,6 @@ begin
     FInference.SetCancelCallback(ACallback, AUserData);
 end;
 
-
-// ---------------------------------------------------------------------------
-// Conversation
-// ---------------------------------------------------------------------------
-
 function TVdxSession.Chat(const AUserMessage: string;
   const AMaxTokens: Integer): string;
 var
@@ -387,10 +368,9 @@ begin
   // 1. Store raw user text for rebuild search queries
   FLastUserMessage := AUserMessage;
 
-  // 2. Log user turn to memory
-  FMemory.AppendTurn(CVdxMemRoleUser, AUserMessage, 0);
-
-  // 3. Per-turn RAG retrieval — search for relevant chunks and facts
+  // 2. Per-turn RAG retrieval — run BEFORE logging the user turn so
+  // the just-asked question doesn't self-match in FTS5/vector search
+  // and burn a retrieval slot on itself.
   LContext := '';
   if FRetrievalConfig.Enabled and (FRetrievalConfig.TopK > 0) then
   begin
@@ -400,17 +380,25 @@ begin
       LContext := FormatRetrievedContext(LRetrieved);
   end;
 
+  // 3. Log user turn to memory (after retrieval — see comment above)
+  FMemory.AppendTurn(CVdxMemRoleUser, AUserMessage, 0);
+
   // 4. Assemble prompt (system + context + user)
   LPrompt := FormatPrompt(AUserMessage, LContext);
 
   // 5. Generate assistant response
-  LResponse := FInference.Generate(LPrompt, AMaxTokens);
+  LResponse := FInference.Generate(LPrompt, AMaxTokens, False);
 
-  // 6. Log assistant turn to memory
-  FMemory.AppendTurn(CVdxMemRoleAssistant, LResponse, 0);
+  // 6. Assistant turn is NOT logged to memory. Freely-generated model
+  // output varies between runs and never deduplicates, so storing it
+  // pollutes semantic retrieval with noise (especially failure-mode
+  // responses like "I don't know your name" cosine-matching future
+  // "what is my name" queries). The assistant side still flows through
+  // the KV cache for in-session continuity; only long-term memory skips
+  // it. User facts (the signal worth retrieving) come from user turns.
 
-  // 7. Track turn count (user + assistant = 2 per Chat call)
-  Inc(FTurnIndex, 2);
+  // 7. Track turn count — one user turn logged per Chat call.
+  Inc(FTurnIndex, 1);
 
   Result := LResponse;
 end;
@@ -425,10 +413,6 @@ begin
   FTurnIndex := 0;
   FLastUserMessage := '';
 end;
-
-// ---------------------------------------------------------------------------
-// Private — prompt formatting
-// ---------------------------------------------------------------------------
 
 function TVdxSession.FormatPrompt(const AUserMessage: string;
   const AContext: string): string;
@@ -460,71 +444,21 @@ begin
     Result := #10 + Result;
 end;
 
-// ---------------------------------------------------------------------------
-// Private — shared retrieval
-// ---------------------------------------------------------------------------
-
 function TVdxSession.RetrieveContext(const AQuery: string;
   const ATopK: Integer): TArray<TVdxMemoryTurn>;
-var
-  LFTS5Hits: TArray<TVdxMemoryTurn>;
-  LVectorHits: TArray<TVdxMemoryTurn>;
-  LSeenIds: TDictionary<Int64, Boolean>;
-  LMergeCount: Integer;
-  LI: Integer;
 begin
-  // Search FTS5 (BM25 keyword ranking)
+  // Semantic retrieval only. FTS5 keyword hits were flooding the top-K
+  // and squeezing out the vector results — making the embedder
+  // essentially dead weight. Cosine similarity against the embedder is
+  // the whole point of having one, so defer to it exclusively.
+  SetLength(Result, 0);
+  if (FEmbedder = nil) or (not FEmbedder.IsLoaded()) then
+    Exit;
+
   try
-    LFTS5Hits := FMemory.SearchFTS5(AQuery, ATopK);
+    Result := FMemory.SearchVector(AQuery, ATopK);
   except
-    SetLength(LFTS5Hits, 0);
-  end;
-
-  // Search vector (cosine similarity) if embedder attached
-  if Assigned(FEmbedder) and FEmbedder.IsLoaded() then
-  begin
-    try
-      LVectorHits := FMemory.SearchVector(AQuery, ATopK);
-    except
-      SetLength(LVectorHits, 0);
-    end;
-  end
-  else
-    SetLength(LVectorHits, 0);
-
-  // Merge and deduplicate by TurnId — FTS5 hits first, vector fills
-  LSeenIds := TDictionary<Int64, Boolean>.Create();
-  try
-    LMergeCount := 0;
-    SetLength(Result, ATopK);
-
-    for LI := 0 to High(LFTS5Hits) do
-    begin
-      if LMergeCount >= ATopK then
-        Break;
-      if not LSeenIds.ContainsKey(LFTS5Hits[LI].TurnId) then
-      begin
-        LSeenIds.Add(LFTS5Hits[LI].TurnId, True);
-        Result[LMergeCount] := LFTS5Hits[LI];
-        Inc(LMergeCount);
-      end;
-    end;
-
-    for LI := 0 to High(LVectorHits) do
-    begin
-      if LMergeCount >= ATopK then
-        Break;
-      if not LSeenIds.ContainsKey(LVectorHits[LI].TurnId) then
-      begin
-        LSeenIds.Add(LVectorHits[LI].TurnId, True);
-        Result[LMergeCount] := LVectorHits[LI];
-        Inc(LMergeCount);
-      end;
-    end;
-
-    SetLength(Result, LMergeCount);
-  finally
-    LSeenIds.Free();
+    SetLength(Result, 0);
   end;
 end;
 
@@ -532,6 +466,8 @@ function TVdxSession.FormatRetrievedContext(
   const ATurns: TArray<TVdxMemoryTurn>): string;
 var
   LI: Integer;
+  LRole: string;
+  LLabel: string;
 begin
   if Length(ATurns) = 0 then
   begin
@@ -539,57 +475,44 @@ begin
     Exit;
   end;
 
-  Result := 'Reference information:';
+  // Label each retrieved turn with its source so the instruction-tuned
+  // model understands whether a past statement came from the user or
+  // from the assistant. Facts and document chunks use 'reference'
+  // since they're neither speaker side.
+  Result := 'Relevant prior context:';
   for LI := 0 to High(ATurns) do
-    Result := Result + #10 + '- ' + ATurns[LI].Text;
-end;
+  begin
+    LRole := ATurns[LI].Role;
+    if LRole = CVdxMemRoleUser then
+      LLabel := 'user'
+    else if LRole = CVdxMemRoleAssistant then
+      LLabel := 'assistant'
+    else
+      LLabel := 'reference';
 
-// ---------------------------------------------------------------------------
-// Private — rebuild handler
-// ---------------------------------------------------------------------------
+    Result := Result + #10 + '[' + LLabel + '] ' + ATurns[LI].Text;
+  end;
+end;
 
 function TVdxSession.HandleRebuild(const APosition: UInt32;
   const AMaxContext: UInt32; const APrompt: string): string;
 var
-  LRetrieved: TArray<TVdxMemoryTurn>;
   LResult: string;
-  LI: Integer;
 begin
-  Result := '';
-  if not IsLoaded() then
-    Exit;
-
-  // --- 1. Retrieve relevant context via RAG ---
-  LRetrieved := RetrieveContext(FLastUserMessage, CVdxSessionMergeTopK);
-
-  // --- 2. Assemble lean replacement prompt ---
-  // Single user turn: system prompt + retrieved context + current question
-  LResult := '<start_of_turn>user' + #10;
+  // Start the new cache like a fresh session: system prompt + current
+  // user message. Generate() wraps this in the chat template and
+  // prefills it against the freshly zeroed KV. No RAG rebuild — per-turn
+  // RAG already fired in Chat() before this callback, and subsequent
+  // turns will RAG naturally from the DB.
+  LResult := '';
 
   if FSystemPrompt <> '' then
-    LResult := LResult + FSystemPrompt + #10 + #10;
-
-  if Length(LRetrieved) > 0 then
-  begin
-    LResult := LResult + 'Reference information:' + #10;
-    for LI := 0 to High(LRetrieved) do
-      LResult := LResult + '- ' + LRetrieved[LI].Text + #10;
-    LResult := LResult + #10;
-  end;
+    LResult := FSystemPrompt + #10 + #10;
 
   LResult := LResult + FLastUserMessage;
-  LResult := LResult + '<end_of_turn>' + #10;
-
-  // Open model turn for generation
-  LResult := LResult + '<start_of_turn>model' + #10;
 
   Result := LResult;
 end;
-
-
-// ---------------------------------------------------------------------------
-// Knowledge
-// ---------------------------------------------------------------------------
 
 function TVdxSession.AddDocument(const ASource: string;
   const ATitle: string; const AText: string;
@@ -611,10 +534,6 @@ begin
   else
     Result := -1;
 end;
-
-// ---------------------------------------------------------------------------
-// Info
-// ---------------------------------------------------------------------------
 
 function TVdxSession.GetStats(): PVdxInferenceStats;
 begin

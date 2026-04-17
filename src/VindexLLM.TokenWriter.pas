@@ -84,14 +84,34 @@ end;
 procedure TVdxTokenWriter.Write(const AToken: string);
 var
   LI: Integer;
+  LLen: Integer;
   LCh: Char;
+  LChStr: string;   // one full codepoint — 1 or 2 Delphi Chars
 begin
-  for LI := 1 to Length(AToken) do
+  LI := 1;
+  LLen := Length(AToken);
+  while LI <= LLen do
   begin
     LCh := AToken[LI];
 
+    // If this is a high surrogate paired with a following low surrogate,
+    // treat both Chars as a single codepoint so UTF-16 → UTF-8 conversion
+    // in DoWrite never sees an unpaired surrogate (which would emit
+    // U+FFFD replacement characters on a UTF-8 console).
+    if (LCh >= #$D800) and (LCh <= #$DBFF) and (LI < LLen) and
+       (AToken[LI + 1] >= #$DC00) and (AToken[LI + 1] <= #$DFFF) then
+    begin
+      LChStr := AToken[LI] + AToken[LI + 1];
+      Inc(LI, 2);
+    end
+    else
+    begin
+      LChStr := LCh;
+      Inc(LI);
+    end;
+
     // --- Newline: flush current word, move to next line ---
-    if LCh = #10 then
+    if LChStr = #10 then
     begin
       FlushWord();
       DoNewLine();
@@ -101,7 +121,7 @@ begin
     end;
 
     // --- Space: flush current word, emit the space ---
-    if LCh = ' ' then
+    if LChStr = ' ' then
     begin
       FlushWord();
       DoWrite(' ');
@@ -112,8 +132,8 @@ begin
     end;
 
     // --- Printable character: accumulate in word buffer ---
-    FWordBuffer := FWordBuffer + LCh;
-    DoWrite(LCh);
+    FWordBuffer := FWordBuffer + LChStr;
+    DoWrite(LChStr);
     FColumn := FColumn + 1;
 
     // Check if we've hit the margin mid-word

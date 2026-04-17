@@ -344,7 +344,8 @@ type
     function GetRebuildAt(): UInt32;
 
     function Generate(const APrompt: string;
-      const AMaxTokens: Integer = 256): string;
+      const AMaxTokens: Integer = 256;
+      const AFormat: Boolean = True): string;
 
     procedure UnloadModel();
 
@@ -1674,7 +1675,7 @@ begin
 end;
 
 function TVdxInference.Generate(const APrompt: string;
-  const AMaxTokens: Integer): string;
+  const AMaxTokens: Integer; const AFormat: Boolean): string;
 var
   LFormatted: string;
   LTokenIds: TArray<Integer>;
@@ -1689,6 +1690,7 @@ var
   LGenWatch: TStopwatch;
   LEffectivePrompt: string;
   LReplacement: string;
+  LRebuilt: Boolean;
 begin
   Result := '';
   FErrors.Clear();
@@ -1708,6 +1710,7 @@ begin
   // The check fires at most once per Generate() invocation — the
   // replacement is NOT re-checked against the threshold.
   LEffectivePrompt := APrompt;
+  LRebuilt := False;
   if FRebuildCallback.IsAssigned() and
      (FRebuildAt > 0) and
      (FCurrentPosition >= FRebuildAt) then
@@ -1715,10 +1718,16 @@ begin
     LReplacement := FRebuildCallback.Callback(
       FCurrentPosition, FMaxSeqLen, APrompt,
       FRebuildCallback.UserData);
+
+    // Callback firing IS the rebuild signal — always reset the cache.
+    // If the callback returned a replacement, wrap it below; otherwise
+    // proceed with the original APrompt against the freshly zeroed
+    // cache. Tokenization will BOS-prefix since FCurrentPosition = 0.
+    ResetKVCache();
     if LReplacement <> '' then
     begin
-      ResetKVCache();
       LEffectivePrompt := LReplacement;
+      LRebuilt := True;
     end;
   end;
 
@@ -1726,8 +1735,13 @@ begin
   FStats := Default(TVdxInferenceStats);
   FStats.VRAMUsage := FVRAMUsage;
 
-  // Format prompt with chat template
-  LFormatted := TVdxChatTemplate.FormatPrompt(FArchitecture, LEffectivePrompt);
+  // Format prompt with chat template. Skip when the caller already
+  // formatted (AFormat=False), UNLESS a rebuild just produced a raw
+  // replacement prompt that needs wrapping.
+  if AFormat or LRebuilt then
+    LFormatted := TVdxChatTemplate.FormatPrompt(FArchitecture, LEffectivePrompt)
+  else
+    LFormatted := LEffectivePrompt;
 
   // Tokenize. Only add BOS on fresh sessions — continuations must NOT
   // restart the token stream, otherwise the model sees a spurious begin-of-
@@ -1736,16 +1750,49 @@ begin
   LTokenCount := Length(LTokenIds);
 
   // Guard: current position + prompt tokens + max generation budget must
-  // fit within the context window. Overflow returns srContextFull without
-  // mutating any state (no partial prefill, no FCurrentPosition change).
+  // fit within the context window. If overflow occurs and a rebuild
+  // callback is available (and hasn't already fired), try a reactive
+  // rebuild before giving up — this covers the case where the proactive
+  // threshold wasn't reached but there's no room for the next turn.
   if UInt64(FCurrentPosition) + UInt64(LTokenCount) + UInt64(AMaxTokens)
     > UInt64(FMaxSeqLen) then
   begin
-    FStats.StopReason := srContextFull;
-    FErrors.Add(esError, 'GEN',
-      'Context overflow: pos=%d + prompt=%d + max=%d exceeds max context %d',
-      [FCurrentPosition, LTokenCount, AMaxTokens, FMaxSeqLen]);
-    Exit;
+    if (not LRebuilt) and FRebuildCallback.IsAssigned() and
+       (FCurrentPosition > 0) then
+    begin
+      LReplacement := FRebuildCallback.Callback(
+        FCurrentPosition, FMaxSeqLen, APrompt,
+        FRebuildCallback.UserData);
+
+      // Reactive overflow + callback assigned — always reset. The DB
+      // retains full conversation state, so no replacement prefill is
+      // required; the original APrompt (already RAG-augmented by the
+      // caller) re-tokenizes cleanly against the fresh cache.
+      ResetKVCache();
+      //LRebuilt := True;
+
+      if LReplacement <> '' then
+      begin
+        LEffectivePrompt := LReplacement;
+        LFormatted := TVdxChatTemplate.FormatPrompt(
+          FArchitecture, LEffectivePrompt);
+      end;
+
+      // Re-tokenize (BOS added since FCurrentPosition is now 0).
+      LTokenIds := FTokenizer.Encode(LFormatted, True);
+      LTokenCount := Length(LTokenIds);
+    end;
+
+    // Final check — if still overflowing after rebuild, give up
+    if UInt64(FCurrentPosition) + UInt64(LTokenCount) + UInt64(AMaxTokens)
+      > UInt64(FMaxSeqLen) then
+    begin
+      FStats.StopReason := srContextFull;
+      FErrors.Add(esError, 'GEN',
+        'Context overflow: pos=%d + prompt=%d + max=%d exceeds max context %d',
+        [FCurrentPosition, LTokenCount, AMaxTokens, FMaxSeqLen]);
+      Exit;
+    end;
   end;
 
   LTotalWatch := TStopwatch.StartNew();
