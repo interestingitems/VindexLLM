@@ -42,6 +42,14 @@ const
 
 type
 
+  { TVdxRetrievalConfig — controls per-turn RAG retrieval behavior.
+    When Enabled, Chat() searches the memory DB for relevant chunks
+    and facts and injects them as context in the user prompt. }
+  TVdxRetrievalConfig = record
+    Enabled: Boolean;       // master switch (default True)
+    TopK: Integer;          // max retrieved items per Chat() call (default 3)
+  end;
+
   { TVdxSession — high-level inference facade that ties together
     TVdxInference, TVdxMemory, and TVdxEmbeddings. The caller creates
     one instance, loads a model, and has a multi-turn conversation via
@@ -58,14 +66,27 @@ type
     FSystemPrompt: string;
     FTurnIndex: Integer;           // tracks turn count for prompt assembly
     FLastUserMessage: string;      // raw user text for rebuild search queries
+    FRetrievalConfig: TVdxRetrievalConfig;
 
 
     // Caller-facing callbacks — stored here, forwarded to FInference
     FTokenCallback: TVdxCallback<TVdxTokenCallback>;
     FCancelCallback: TVdxCallback<TVdxCancelCallback>;
 
-    // Prompt formatting — builds Gemma 3 chat template strings
-    function FormatPrompt(const AUserMessage: string): string;
+    // Shared retrieval helper — searches FTS5 + optional vector,
+    // deduplicates by TurnId, returns up to ATopK merged results.
+    function RetrieveContext(const AQuery: string;
+      const ATopK: Integer): TArray<TVdxMemoryTurn>;
+
+    // Formats retrieved turns into a labeled context block for prompt
+    // injection. Chunks and facts become "Reference information".
+    function FormatRetrievedContext(
+      const ATurns: TArray<TVdxMemoryTurn>): string;
+
+    // Prompt formatting — builds Gemma 3 chat template strings.
+    // AContext is a pre-formatted context block (or '' for none).
+    function FormatPrompt(const AUserMessage: string;
+      const AContext: string): string;
 
     // Rebuild handler — installed on FInference.SetRebuildCallback.
     // Queries FMemory for relevant context and assembles a replacement
@@ -93,6 +114,8 @@ type
     // --- Configuration ---
     procedure SetSystemPrompt(const APrompt: string);
     procedure SetSamplerConfig(const AConfig: TVdxSamplerConfig);
+    procedure SetRetrievalConfig(const AConfig: TVdxRetrievalConfig);
+    class function DefaultRetrievalConfig(): TVdxRetrievalConfig; static;
     procedure SetTokenCallback(const ACallback: TVdxTokenCallback;
       const AUserData: Pointer);
     procedure SetCancelCallback(const ACallback: TVdxCancelCallback;
@@ -130,6 +153,7 @@ begin
   FSystemPrompt := '';
   FTurnIndex := 0;
   FLastUserMessage := '';
+  FRetrievalConfig := DefaultRetrievalConfig();
   FTokenCallback := Default(TVdxCallback<TVdxTokenCallback>);
   FCancelCallback := Default(TVdxCallback<TVdxCancelCallback>);
 end;
@@ -307,6 +331,17 @@ begin
     FInference.SetSamplerConfig(AConfig);
 end;
 
+procedure TVdxSession.SetRetrievalConfig(const AConfig: TVdxRetrievalConfig);
+begin
+  FRetrievalConfig := AConfig;
+end;
+
+class function TVdxSession.DefaultRetrievalConfig(): TVdxRetrievalConfig;
+begin
+  Result.Enabled := True;
+  Result.TopK := 3;
+end;
+
 procedure TVdxSession.SetTokenCallback(const ACallback: TVdxTokenCallback;
   const AUserData: Pointer);
 begin
@@ -335,28 +370,58 @@ function TVdxSession.Chat(const AUserMessage: string;
 var
   LPrompt: string;
   LResponse: string;
+  LContext: string;
+  LRetrieved: TArray<TVdxMemoryTurn>;
+  LFiltered: TArray<TVdxMemoryTurn>;
+  LFilterCount: Integer;
+  LI: Integer;
 begin
   Result := '';
 
   if not IsLoaded() then
     Exit;
 
-  // 1. Log user turn to memory
-  FMemory.AppendTurn(CVdxMemRoleUser, AUserMessage, 0);
-
-  // 2. Assemble prompt (system + user or continuation)
-  LPrompt := FormatPrompt(AUserMessage);
-
-  // 3. Store raw user text for rebuild search queries
+  // 1. Store raw user text for rebuild search queries
   FLastUserMessage := AUserMessage;
 
-  // 4. Generate assistant response
+  // 2. Log user turn to memory
+  FMemory.AppendTurn(CVdxMemRoleUser, AUserMessage, 0);
+
+  // 3. Per-turn RAG retrieval — search for relevant chunks and facts
+  LContext := '';
+  if FRetrievalConfig.Enabled and (FRetrievalConfig.TopK > 0) then
+  begin
+    LRetrieved := RetrieveContext(AUserMessage, FRetrievalConfig.TopK);
+
+    // Filter to document roles only (chunk, fact). Conversation turns
+    // are already in the KV cache — including them here would duplicate.
+    LFilterCount := 0;
+    SetLength(LFiltered, Length(LRetrieved));
+    for LI := 0 to High(LRetrieved) do
+    begin
+      if (LRetrieved[LI].Role = CVdxMemRoleChunk) or
+         (LRetrieved[LI].Role = CVdxMemRoleFact) then
+      begin
+        LFiltered[LFilterCount] := LRetrieved[LI];
+        Inc(LFilterCount);
+      end;
+    end;
+    SetLength(LFiltered, LFilterCount);
+
+    if LFilterCount > 0 then
+      LContext := FormatRetrievedContext(LFiltered);
+  end;
+
+  // 4. Assemble prompt (system + context + user)
+  LPrompt := FormatPrompt(AUserMessage, LContext);
+
+  // 5. Generate assistant response
   LResponse := FInference.Generate(LPrompt, AMaxTokens);
 
-  // 5. Log assistant turn to memory
+  // 6. Log assistant turn to memory
   FMemory.AppendTurn(CVdxMemRoleAssistant, LResponse, 0);
 
-  // 6. Track turn count (user + assistant = 2 per Chat call)
+  // 7. Track turn count (user + assistant = 2 per Chat call)
   Inc(FTurnIndex, 2);
 
   Result := LResponse;
@@ -366,17 +431,25 @@ end;
 // Private — prompt formatting
 // ---------------------------------------------------------------------------
 
-function TVdxSession.FormatPrompt(const AUserMessage: string): string;
+function TVdxSession.FormatPrompt(const AUserMessage: string;
+  const AContext: string): string;
 var
   LContent: string;
 begin
   // Build the content to place inside the user turn.
-  // First turn with a system prompt: combine system + user in one turn.
-  // Continuation or no system prompt: just the user message.
+  // Layout: [system prompt] [context block] [user message]
+  LContent := '';
+
+  // System prompt on first turn only
   if (FInference.GetKVCachePosition() = 0) and (FSystemPrompt <> '') then
-    LContent := FSystemPrompt + #10 + #10 + AUserMessage
-  else
-    LContent := AUserMessage;
+    LContent := FSystemPrompt + #10 + #10;
+
+  // Injected RAG context (if any)
+  if AContext <> '' then
+    LContent := LContent + AContext + #10 + #10;
+
+  // User message
+  LContent := LContent + AUserMessage;
 
   // Wrap in Gemma 3 chat template:
   //   <start_of_turn>user\n{content}<end_of_turn>\n<start_of_turn>model\n
@@ -389,39 +462,30 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// Private — rebuild handler
+// Private — shared retrieval
 // ---------------------------------------------------------------------------
 
-function TVdxSession.HandleRebuild(const APosition: UInt32;
-  const AMaxContext: UInt32; const APrompt: string): string;
+function TVdxSession.RetrieveContext(const AQuery: string;
+  const ATopK: Integer): TArray<TVdxMemoryTurn>;
 var
   LFTS5Hits: TArray<TVdxMemoryTurn>;
   LVectorHits: TArray<TVdxMemoryTurn>;
-  LMerged: TArray<TVdxMemoryTurn>;
-  LRecent: TArray<TVdxMemoryTurn>;
   LSeenIds: TDictionary<Int64, Boolean>;
   LMergeCount: Integer;
-  LResult: string;
   LI: Integer;
 begin
-  Result := '';
-  if not IsLoaded() then
-    Exit;
-
-  // --- 1. Retrieve relevant context via search ---
-  // Wrapped in try/except so a search failure degrades gracefully
-  // (empty retrieval) instead of crashing the generation cycle.
+  // Search FTS5 (BM25 keyword ranking)
   try
-    LFTS5Hits := FMemory.SearchFTS5(FLastUserMessage, CVdxSessionFTS5TopK);
+    LFTS5Hits := FMemory.SearchFTS5(AQuery, ATopK);
   except
     SetLength(LFTS5Hits, 0);
   end;
 
+  // Search vector (cosine similarity) if embedder attached
   if Assigned(FEmbedder) and FEmbedder.IsLoaded() then
   begin
     try
-      LVectorHits := FMemory.SearchVector(FLastUserMessage,
-        CVdxSessionVectorTopK);
+      LVectorHits := FMemory.SearchVector(AQuery, ATopK);
     except
       SetLength(LVectorHits, 0);
     end;
@@ -429,59 +493,93 @@ begin
   else
     SetLength(LVectorHits, 0);
 
-  // --- 2. Merge and deduplicate by turn_id ---
+  // Merge and deduplicate by TurnId — FTS5 hits first, vector fills
   LSeenIds := TDictionary<Int64, Boolean>.Create();
   try
     LMergeCount := 0;
-    SetLength(LMerged, CVdxSessionMergeTopK);
+    SetLength(Result, ATopK);
 
-    // FTS5 hits first (BM25 ranked)
     for LI := 0 to High(LFTS5Hits) do
     begin
-      if LMergeCount >= CVdxSessionMergeTopK then
+      if LMergeCount >= ATopK then
         Break;
       if not LSeenIds.ContainsKey(LFTS5Hits[LI].TurnId) then
       begin
         LSeenIds.Add(LFTS5Hits[LI].TurnId, True);
-        LMerged[LMergeCount] := LFTS5Hits[LI];
+        Result[LMergeCount] := LFTS5Hits[LI];
         Inc(LMergeCount);
       end;
     end;
 
-    // Vector hits fill remaining slots (cosine ranked)
     for LI := 0 to High(LVectorHits) do
     begin
-      if LMergeCount >= CVdxSessionMergeTopK then
+      if LMergeCount >= ATopK then
         Break;
       if not LSeenIds.ContainsKey(LVectorHits[LI].TurnId) then
       begin
         LSeenIds.Add(LVectorHits[LI].TurnId, True);
-        LMerged[LMergeCount] := LVectorHits[LI];
+        Result[LMergeCount] := LVectorHits[LI];
         Inc(LMergeCount);
       end;
     end;
 
-    SetLength(LMerged, LMergeCount);
+    SetLength(Result, LMergeCount);
   finally
     LSeenIds.Free();
   end;
+end;
 
-  // --- 3. Get recent turns (includes current user message) ---
+function TVdxSession.FormatRetrievedContext(
+  const ATurns: TArray<TVdxMemoryTurn>): string;
+var
+  LI: Integer;
+begin
+  if Length(ATurns) = 0 then
+  begin
+    Result := '';
+    Exit;
+  end;
+
+  Result := 'Reference information:';
+  for LI := 0 to High(ATurns) do
+    Result := Result + #10 + '- ' + ATurns[LI].Text;
+end;
+
+// ---------------------------------------------------------------------------
+// Private — rebuild handler
+// ---------------------------------------------------------------------------
+
+function TVdxSession.HandleRebuild(const APosition: UInt32;
+  const AMaxContext: UInt32; const APrompt: string): string;
+var
+  LRetrieved: TArray<TVdxMemoryTurn>;
+  LRecent: TArray<TVdxMemoryTurn>;
+  LResult: string;
+  LI: Integer;
+begin
+  Result := '';
+  if not IsLoaded() then
+    Exit;
+
+  // --- 1. Retrieve relevant context (all roles — rebuild is full reconstruction) ---
+  LRetrieved := RetrieveContext(FLastUserMessage, CVdxSessionMergeTopK);
+
+  // --- 2. Get recent turns (includes current user message) ---
   LRecent := FMemory.GetRecentTurns(CVdxSessionRecentTurns);
 
-  // --- 4. Assemble replacement prompt ---
+  // --- 3. Assemble replacement prompt ---
   // First user turn: system prompt + retrieved context summary
   LResult := '<start_of_turn>user' + #10;
 
   if FSystemPrompt <> '' then
     LResult := LResult + FSystemPrompt + #10 + #10;
 
-  if LMergeCount > 0 then
+  if Length(LRetrieved) > 0 then
   begin
     LResult := LResult + 'Earlier conversation context:' + #10;
-    for LI := 0 to High(LMerged) do
-      LResult := LResult + LMerged[LI].Role + ': ' +
-        LMerged[LI].Text + #10;
+    for LI := 0 to High(LRetrieved) do
+      LResult := LResult + LRetrieved[LI].Role + ': ' +
+        LRetrieved[LI].Text + #10;
     LResult := LResult + #10;
   end;
 

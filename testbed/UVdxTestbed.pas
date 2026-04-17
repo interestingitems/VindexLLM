@@ -2197,6 +2197,17 @@ begin
       LSession.SetSystemPrompt(
         'You are a helpful assistant. Keep answers brief.');
 
+      // --- RAG test: inject a fact and verify retrieval ---
+      Banner('RAG - AddFact + retrieval');
+      LSession.AddFact(
+        'The secret project codename is Operation Bluebird.');
+      LResponse := LSession.Chat(
+        'What is the secret project codename?', 64);
+      TVdxUtils.PrintLn('');
+      TVdxUtils.PrintLn(COLOR_CYAN + '  Response: %s', [LResponse]);
+      Check('RAG response contains "Bluebird"',
+        Pos('Bluebird', LResponse) > 0);
+
       // --- Turn 1 ---
       Banner('CHAT - Turn 1');
       LResponse := LSession.Chat(
@@ -2213,8 +2224,8 @@ begin
       // --- Turn count ---
       Banner('TURN COUNT');
       TVdxUtils.PrintLn('  TurnCount: %d', [LSession.GetTurnCount()]);
-      Check('GetTurnCount = 4 (2 user + 2 assistant)',
-        LSession.GetTurnCount() = 4);
+      Check('GetTurnCount = 7 (1 fact + 3 chat x 2)',
+        LSession.GetTurnCount() = 7);
 
       // --- Drive more turns to cross rebuild threshold (80 tokens) ---
       Banner('CHAT - Turn 3 (driving toward rebuild)');
